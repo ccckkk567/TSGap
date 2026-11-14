@@ -1,0 +1,168 @@
+"""Existing rollout-only Ray workers and the shared vanilla environment loop."""
+from pathlib import Path
+from itertools import count
+from .records import EpisodeRecorder, write_json
+
+_runtime_numbers = count()
+
+
+class SequentialRollouts:
+    """Keep one model worker group resident and switch only when needed."""
+    def __init__(self, config):
+        self.config = config
+        self.current = None
+
+    def activate(self, role):
+        if self.current is None or self.current.role != role:
+            self.close()
+            self.current = RolloutRuntime(self.config, role)
+        return self.current
+
+    def close(self):
+        if self.current is not None:
+            self.current.close()
+            self.current = None
+
+
+class RolloutRuntime:
+    def __init__(self, config, role, model_path=None, sampling=None):
+        import ray
+        from omegaconf import OmegaConf
+        from verl.utils import hf_tokenizer
+        from verl.utils.fs import copy_to_local
+        from verl.workers.fsdp_workers import ActorRolloutRefWorker
+        from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+        from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+        settings = config[role]
+        if settings.n_gpus > config.hardware.n_gpus:
+            raise ValueError(f"{role}.n_gpus exceeds the configured job GPU allocation")
+        if settings.n_gpus % settings.tensor_parallel_size:
+            raise ValueError(f"{role}.n_gpus must be divisible by tensor_parallel_size")
+        if ray.available_resources().get("GPU", 0) < settings.n_gpus:
+            raise ValueError(f"Insufficient free GPUs for {role}: requested {settings.n_gpus}")
+        self.config = config
+        self.role = role
+        self.action_sampling = OmegaConf.to_container(sampling or settings.action, resolve=True)
+        capacity = self.action_sampling["max_tokens"]
+        if role == "teacher":
+            capacity = max(capacity, settings.reflection.max_tokens)
+        base = Path(__file__).resolve().parents[2] / "verl/trainer/config/generation.yaml"
+        worker_config = OmegaConf.load(base)
+        worker_config.model.path = model_path or settings.model_path
+        worker_config.rollout.update(
+            n=1, prompt_length=settings.prompt_length, response_length=capacity,
+            tensor_model_parallel_size=settings.tensor_parallel_size,
+            gpu_memory_utilization=settings.gpu_memory_utilization,
+            max_model_len=settings.prompt_length + capacity,
+            max_num_batched_tokens=settings.prompt_length + capacity,
+            enable_chunked_prefill=False,
+        )
+        self.tokenizer = hf_tokenizer(copy_to_local(worker_config.model.path))
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.collector = TrajectoryCollector(OmegaConf.create({
+            "data": {"max_prompt_length": settings.prompt_length, "return_raw_chat": True},
+            "env": {"max_steps": config.env.max_steps, "rollout": {"n": 1}},
+        }), self.tokenizer)
+        self.name_prefix = f"teaching_{role}_{next(_runtime_numbers)}"
+        self.pool = RayResourcePool([settings.n_gpus], name_prefix=self.name_prefix, max_colocate_count=1)
+        worker = RayClassWithInitArgs(ray.remote(ActorRolloutRefWorker), config=worker_config, role="rollout")
+        self.group = RayWorkerGroup(self.pool, worker, name_prefix=self.name_prefix)
+        self.group.init_model()
+        self.request_index = 0
+        self.sampling = self.action_sampling
+        self.episode_seed = 0
+
+    def generate_sequences(self, data):
+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+        data.meta_info["sampling_overrides"] = dict(
+            self.sampling, n=1, seed=self.episode_seed + self.request_index,
+        )
+        self.request_index += 1
+        padded, padding = pad_dataproto_to_divisor(data, self.group.world_size)
+        return unpad_dataproto(self.group.generate_sequences(padded), padding)
+
+    def initial_batch(self):
+        import numpy as np
+        import torch
+        from verl import DataProto
+        raw = np.empty(1, dtype=object)
+        raw[0] = [dict(role="user", content="")]
+        return DataProto.from_dict(
+            tensors={"input_ids": torch.zeros((1, 1), dtype=torch.long)},
+            non_tensors={"raw_prompt": raw, "data_source": np.array(["alfworld"], dtype=object)},
+        )
+
+    def episode(self, envs, task, path, metadata, demonstration="", guidance=""):
+        from .tasks import environment_config
+        root, _ = environment_config(self.config)
+        recorder = EpisodeRecorder(dict(task, **metadata))
+        self.episode_seed = metadata["generation_settings"]["seed"]
+        self.request_index = 0
+        self.sampling = self.action_sampling
+        try:
+            self.collector.vanilla_multi_turn_loop(
+                self.initial_batch(), self, envs,
+                reset_kwargs={
+                    "task_specs": [dict(game_file=str(root / task["game_file"]), env_seed=metadata["env_seed"])],
+                    "episode_contexts": [dict(demonstration=demonstration, teacher_guidance=guidance)],
+                },
+                episode_recorder=recorder,
+            )
+            record = recorder.finish()
+        except BaseException as error:
+            write_json(Path(path).with_suffix(".error.json"), recorder.fail(error))
+            raise
+        write_json(path, record)
+        return record
+
+    def reflect(self, prompt, seed):
+        self.episode_seed, self.request_index = seed, 0
+        from omegaconf import OmegaConf
+        self.sampling = OmegaConf.to_container(self.config.teacher.reflection, resolve=True)
+        batch = self.collector.preprocess_batch(self.initial_batch(), {"text": [prompt], "anchor": [prompt]})
+        output = self.generate_sequences(batch)
+        return self.tokenizer.decode(output.batch["responses"][0], skip_special_tokens=True)
+
+    def close(self):
+        import ray
+        import time
+        from ray.util import remove_placement_group, placement_group_table
+        from ray.util.state import get_actor
+        workers = list(self.group._workers)
+        try:
+            workers.append(ray.get_actor(f"{self.name_prefix}_register_center"))
+        except ValueError:
+            pass
+        for worker in workers:
+            ray.kill(worker, no_restart=True)
+        groups = self.pool.pgs or []
+        for group in groups:
+            remove_placement_group(group)
+        # Ray teardown is asynchronous. Wait before allocating the next model.
+        deadline = time.monotonic() + 30
+        while True:
+            actors_done = all(
+                (get_actor(worker._actor_id.hex()) or {}).get("state", "DEAD") == "DEAD"
+                for worker in workers
+            )
+            groups_done = all(placement_group_table(group).get("state") == "REMOVED" for group in groups)
+            resources_free = ray.available_resources().get("GPU", 0) >= self.pool.world_size
+            if actors_done and groups_done and resources_free:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Previous rollout workers have not released their GPU resources")
+            time.sleep(0.1)
+
+
+def make_environment(config):
+    from omegaconf import OmegaConf
+    from agent_system.environments.env_package.alfworld.envs import AlfworldEnvs
+    from agent_system.environments.env_package.alfworld.projection import alfworld_projection
+    from agent_system.environments.env_manager import AlfWorldEnvironmentManager
+    from .tasks import environment_config
+    _, settings = environment_config(config)
+    envs = AlfworldEnvs(config.env.config_path, seed=config.env.seed,
+                       config_override=settings)
+    manager_config = OmegaConf.create({"env": {"alfworld": {"meta_think": False, "action_only": False}}})
+    return AlfWorldEnvironmentManager(envs, alfworld_projection, config.env.env_name, manager_config)

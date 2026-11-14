@@ -159,11 +159,11 @@ class vLLMRollout(BaseRollout):
                     old_value = getattr(self.sampling_params, key)
                     old_sampling_params_args[key] = old_value
                     setattr(self.sampling_params, key, value)
-        yield
-        # roll back to previous sampling params
-        # if len(old_sampling_params_args):
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
+        try:
+            yield
+        finally:
+            for key, value in old_sampling_params_args.items():
+                setattr(self.sampling_params, key, value)
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -228,6 +228,13 @@ class vLLMRollout(BaseRollout):
                 'n': 1,  # if validate, already repeat in ray_trainer
             }
 
+        overrides = prompts.meta_info.get("sampling_overrides", {})
+        if overrides.get("max_tokens", self.config.response_length) > self.config.response_length:
+            raise ValueError("Requested max_tokens exceeds configured response capacity")
+        for key in overrides:
+            if not hasattr(self.sampling_params, key):
+                raise ValueError(f"Unsupported vLLM sampling parameter: {key}")
+        kwargs.update(overrides)
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(

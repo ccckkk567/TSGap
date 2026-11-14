@@ -172,3 +172,57 @@ Valid actions: go to [recep id], take [obj id] from [recep id], put [obj id] in/
 Choose the most appropriate action from the valid actions.
 </action>
 """
+TEACHING_STEP_TEMPLATE = """You are acting in the ALFWorld household environment.
+Complete the task using the actual observations and admissible actions.
+At each step output exactly one concise <think>...</think> followed by
+one <action>...</action>. Choose an action from the current admissible actions.
+
+{context}
+Task: {task}
+Step: {step_index}
+Recent observation-action history:
+{history}
+
+Current observation:
+{observation}
+
+Current admissible actions:
+{admissible_actions}
+"""
+
+TEACHER_OBJECTIVE = """Complete the task in the real environment and produce a
+self-contained demonstration that another agent can understand."""
+
+
+def build_step_prompt(task, observation, admissible_actions, history, step_index,
+                      demonstration="", teacher_guidance=""):
+    recent = history[-2:]
+    rendered_history = []
+    for offset, entry in enumerate(recent):
+        number = step_index - len(recent) + offset
+        previous_observation = entry.get("observation", entry.get("text_obs"))
+        rendered_history.append(
+            f"Step {number}\nObservation: {previous_observation}\nAction: {entry['action']}"
+        )
+    context = []
+    if demonstration:
+        context.append(f"Complete demonstration:\n{demonstration}")
+    if teacher_guidance:
+        context.append(f"Execution guidance:\n{teacher_guidance}")
+    return TEACHING_STEP_TEMPLATE.format(
+        context="\n\n".join(context), task=task, step_index=step_index,
+        history="\n".join(rendered_history) or "No previous actions.",
+        observation=observation, admissible_actions="\n".join(admissible_actions),
+    )
+
+
+def render_demonstration(episode):
+    parts = [f"Task: {episode['task']}",
+             f"Initial observation: {episode['initial_observation']}"]
+    for step in episode["steps"]:
+        parts.append(
+            f"Step {step['step']}\nObservation: {step['observation']}\n"
+            f"Response: {step['response']}\nAction: {step['action']}\n"
+            f"Environment returned: {step['next_observation']}"
+        )
+    return "\n\n".join(parts)

@@ -1,0 +1,91 @@
+paths:
+  root: /scratch/prjsnnn0000269/Students/shuming/cjk
+  repository: ${paths.root}/code/TSGap
+  models: ${paths.root}/models
+  data: ${paths.root}/data
+  outputs: ${paths.root}/outputs
+  logs: ${paths.root}/logs
+run:
+  name: run01
+  output_dir: ${paths.outputs}/teaching/${run.name}
+  generation_seed: 42
+logging:
+  backends: [console, swanlab]
+  project_name: alfworld-teaching
+  workspace: null
+  mode: online
+  log_dir: ${paths.logs}/${run.name}/swanlab
+  resume: allow
+tasks:
+  split: train
+  per_type: 5
+  sample_seed: 42
+  data_root: ${paths.data}  # Contains json_2.1.1/ and logic/.
+env:
+  env_name: alfworld/AlfredTWEnv
+  config_path: agent_system/environments/env_package/alfworld/configs/config_tw.yaml
+  seed: 0
+  history_length: 2
+  domain_randomization: false
+  max_steps: 50
+teaching:
+  num_versions: 5
+  max_teacher_attempts: 3
+  student_rollouts: 4
+  student_execution: sequential
+selection:
+  policy: within_task_extremes
+  tie_break: earliest_version
+  skip_equal_scores: true
+hardware:
+  gpu_type: H200
+  n_gpus: 1
+  login_nodes: [orion-login01]
+  ray_address: null
+teacher:
+  model_path: ???  # Absolute checkpoint path under paths.models.
+  n_gpus: ${hardware.n_gpus}
+  tensor_parallel_size: 1
+  prompt_length: ???
+  gpu_memory_utilization: 0.5  # Existing veRL starting value; adjust for the chosen checkpoint.
+  action:
+    max_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    top_k: -1
+  reflection:
+    max_tokens: 2048
+    temperature: 0.3
+    top_p: 0.9
+    top_k: -1
+student:
+  model_path: ???  # Absolute checkpoint path under paths.models.
+  n_gpus: ${hardware.n_gpus}
+  tensor_parallel_size: 1
+  prompt_length: ???
+  gpu_memory_utilization: 0.5
+  action:
+    max_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    top_k: -1
+evaluation:
+  manifests:
+    - ${run.output_dir}/manifest_valid_seen.jsonl
+    - ${run.output_dir}/manifest_valid_unseen.jsonl
+  rollouts_per_task: 1
+  sampling:
+    max_tokens: 512
+    temperature: 0.0  # Greedy decoding for initial/high/low.
+    top_p: 1.0
+    top_k: -1
+sft:
+  initial_model_path: ${student.model_path}
+  n_gpus: ${hardware.n_gpus}
+  sequence_parallel_size: 1
+  train_batch_size: ???
+  micro_batch_size_per_gpu: ???
+  learning_rate: 1e-5
+  epochs: 5
+  max_length: ???
+  seed: 1

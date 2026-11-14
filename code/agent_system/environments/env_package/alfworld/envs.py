@@ -48,7 +48,8 @@ def worker_func(remote, config, seed, base_env):
     """
 
     env = base_env.init_env(batch_size=1) # Each worker holds only one sub-environment
-    env.seed(seed) 
+    env.seed(seed)
+    selected_game = None
 
     while True:
         cmd, data = remote.recv()
@@ -60,6 +61,13 @@ def worker_func(remote, config, seed, base_env):
             remote.send((obs, scores, dones, infos))
 
         elif cmd == 'reset':
+            if data is not None:
+                game_file = data['game_file']
+                if game_file != selected_game:
+                    env.close()
+                    env = base_env.init_env(batch_size=1, game_files=[game_file])
+                    selected_game = game_file
+                env.seed(data['env_seed'])
             obs, infos = env.reset()
             infos['observation_text'] = obs
             remote.send((obs, infos))
@@ -70,6 +78,7 @@ def worker_func(remote, config, seed, base_env):
             remote.send(image)
 
         elif cmd == 'close':
+            env.close()
             remote.close()
             break
 
@@ -77,9 +86,9 @@ def worker_func(remote, config, seed, base_env):
             raise NotImplementedError("Unknown command: {}".format(cmd))
 
 class AlfworldEnvs(gym.Env):
-    def __init__(self, alf_config_path, seed=0, env_num=1, group_n=1, is_train=True, unseen=False):
+    def __init__(self, alf_config_path, seed=0, env_num=1, group_n=1, is_train=True, unseen=False, config_override=None):
         super().__init__()
-        config = load_config_file(alf_config_path)
+        config = config_override if config_override is not None else load_config_file(alf_config_path)
         env_type = config['env']['type']
         eval_type = 'eval_out_of_distribution' if unseen else 'eval_in_distribution'
         base_env = get_environment(env_type)(config, train_eval='train' if is_train else eval_type)
@@ -90,7 +99,7 @@ class AlfworldEnvs(gym.Env):
         self.parent_remotes = []
         self.workers = []
 
-        if sys.platform.startswith("win"):
+        if sys.platform.startswith("win") or config_override is not None:
             ctx = mp.get_context('spawn')
         else:
             ctx = mp.get_context('fork')
@@ -143,7 +152,7 @@ class AlfworldEnvs(gym.Env):
 
         return text_obs_list, image_obs_list, rewards_list, dones_list, info_list
 
-    def reset(self):
+    def reset(self, task_specs=None):
         """
         Send the reset command to all subprocesses at once and collect initial obs/info from each environment.
         """
@@ -151,8 +160,8 @@ class AlfworldEnvs(gym.Env):
         image_obs_list = []
         info_list = []
 
-        for remote in self.parent_remotes:
-            remote.send(('reset', None))
+        for i, remote in enumerate(self.parent_remotes):
+            remote.send(('reset', None if task_specs is None else task_specs[i]))
 
         for i, remote in enumerate(self.parent_remotes):
             obs, info = remote.recv()
@@ -195,10 +204,18 @@ class AlfworldEnvs(gym.Env):
         """
         Close all subprocesses
         """
-        for remote in self.parent_remotes:
-            remote.send(('close', None))
+        for remote, worker in zip(self.parent_remotes, self.workers):
+            if worker.is_alive():
+                try:
+                    remote.send(('close', None))
+                except (BrokenPipeError, EOFError):
+                    pass
+            remote.close()
         for worker in self.workers:
-            worker.join()
+            worker.join(timeout=5)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
 
 def build_alfworld_envs(alf_config_path, seed, env_num, group_n, is_train=True, unseen=False):
     return AlfworldEnvs(alf_config_path, seed, env_num, group_n, is_train, unseen)

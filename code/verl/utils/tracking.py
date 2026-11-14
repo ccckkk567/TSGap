@@ -24,7 +24,7 @@ from typing import List, Union, Dict, Any
 class Tracking(object):
     supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console"]
 
-    def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None):
+    def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None, swanlab_kwargs=None):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -35,6 +35,8 @@ class Tracking(object):
                 assert backend in self.supported_backend, f'{backend} is not supported'
 
         self.logger = {}
+        self.swanlab_run = None
+        self._finished = False
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
@@ -60,19 +62,15 @@ class Tracking(object):
             import swanlab
             import os
 
-            SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
-            SWANLAB_LOG_DIR = os.environ.get("SWANLAB_LOG_DIR", "swanlog")
-            SWANLAB_MODE = os.environ.get("SWANLAB_MODE", "cloud")
-            if SWANLAB_API_KEY:
-                swanlab.login(SWANLAB_API_KEY)  # NOTE: previous login information will be overwritten
-            swanlab.init(project=project_name,
-                         experiment_name=experiment_name,
-                         config={
-                             "FRAMEWORK": "veRL",
-                             **config
-                         },
-                         logdir=SWANLAB_LOG_DIR,
-                         mode=SWANLAB_MODE)
+            options = {
+                "logdir": os.environ.get("SWANLAB_LOG_DIR", "swanlog"),
+                "mode": os.environ.get("SWANLAB_MODE", "online"),
+            }
+            options.update(swanlab_kwargs or {})
+            self.swanlab_run = swanlab.init(
+                project=project_name, experiment_name=experiment_name,
+                config={"FRAMEWORK": "veRL", **(config or {})}, **options,
+            )
             self.logger["swanlab"] = swanlab
 
         if 'vemlp_wandb' in default_backend:
@@ -106,7 +104,10 @@ class Tracking(object):
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def __del__(self):
+    def finish(self):
+        if getattr(self, "_finished", True):
+            return
+        self._finished = True
         if 'wandb' in self.logger:
             self.logger['wandb'].finish(exit_code=0)
         if 'swanlab' in self.logger:
@@ -115,6 +116,9 @@ class Tracking(object):
             self.logger['vemlp_wandb'].finish(exit_code=0)
         if 'tensorboard' in self.logger:
             self.logger['tensorboard'].finish()
+
+    def __del__(self):
+        self.finish()
 
 
 class _TensorboardAdapter:

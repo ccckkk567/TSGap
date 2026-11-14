@@ -268,6 +268,8 @@ class TrajectoryCollector:
             gen_batch: DataProto, 
             actor_rollout_wg, 
             envs: EnvironmentManagerBase,
+            reset_kwargs=None,
+            episode_recorder=None,
             ) -> DataProto:
         """
         Collects trajectories through parallel agent-environment agent_loop.
@@ -284,7 +286,9 @@ class TrajectoryCollector:
             traj_uid (np.ndarray): Trajectory unique identifiers
         """
         # Initial observations from the environment
-        obs, infos = envs.reset()
+        obs, infos = envs.reset(**(reset_kwargs or {}))
+        if episode_recorder is not None:
+            episode_recorder.start(envs, obs, infos)
 
         # Initialize trajectory collection
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
@@ -339,7 +343,11 @@ class TrajectoryCollector:
 
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
 
+            if episode_recorder is not None:
+                episode_recorder.before_step(envs, obs, text_actions, active_masks)
             next_obs, rewards, dones, infos = envs.step(text_actions)
+            if episode_recorder is not None:
+                episode_recorder.after_step(next_obs, rewards, dones, infos)
 
             batch.non_tensor_batch['full_output'] = text_actions
 

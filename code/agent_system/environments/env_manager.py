@@ -32,8 +32,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.config = config
         super().__init__(envs, projection_f, env_name)
 
-    def reset(self):
-        text_obs, image_obs, infos = self.envs.reset()
+    def reset(self, task_specs=None, episode_contexts=None):
+        self.episode_contexts = episode_contexts
+        text_obs, image_obs, infos = self.envs.reset() if task_specs is None else self.envs.reset(task_specs=task_specs)
         self.gamefile = parse_gamefile(infos)
         # initialize the history buffer
         if self.buffers is not None:
@@ -63,6 +64,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
             info['action_available'] = to_numpy(action_available[i])
+            info['action'] = actions[i]
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
@@ -82,6 +84,16 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         """
         This function builds the text observation for the agent.
         """
+        if self.episode_contexts is not None:
+            return [
+                build_step_prompt(
+                    task=self.tasks[i], observation=observation,
+                    admissible_actions=admissible_actions[i],
+                    history=self.buffers[i], step_index=len(self.buffers[i]) + 1,
+                    **self.episode_contexts[i],
+                )
+                for i, observation in enumerate(text_obs)
+            ]
         postprocess_text_obs = []
         if self.meta_think:
             _ALFWORLD_TEMPLATE_NO_HIS = ALFWORLD_TEMPLATE_NO_HIS_MC

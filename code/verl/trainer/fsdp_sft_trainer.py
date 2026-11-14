@@ -78,7 +78,12 @@ def convert_to_regular_types(obj):
 class FSDPSFTTrainer(object):
 
     def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh):
+        from transformers import set_seed
+        set_seed(config.trainer.seed)
         self.config = config
+        self.processed_turns = 0
+        self.supervised_tokens = 0
+        self.optimizer_steps = 0
         self.device_mesh = device_mesh
         self.ulysses_device_mesh = ulysses_device_mesh
         self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
@@ -129,9 +134,10 @@ class FSDPSFTTrainer(object):
         self.train_dataset = dataset_cls(parquet_files=config.data.train_files,
                                          tokenizer=self.tokenizer,
                                          config=config.data)
-        self.val_dataset = dataset_cls(parquet_files=config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       config=config.data)
+        self.val_dataset = (
+            dataset_cls(parquet_files=config.data.val_files, tokenizer=self.tokenizer, config=config.data)
+            if config.data.val_files else None
+        )
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
@@ -151,27 +157,31 @@ class FSDPSFTTrainer(object):
 
         self.train_sampler = DistributedSampler(self.train_dataset,
                                                 shuffle=True,
+                                                seed=config.trainer.seed,
                                                 num_replicas=world_size,
                                                 rank=rank,
-                                                drop_last=True)
+                                                drop_last=config.data.get('drop_last', True))
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
                                            sampler=self.train_sampler,
                                            num_workers=8,
                                            pin_memory=True,
-                                           drop_last=True)
+                                           drop_last=config.data.get('drop_last', True))
 
-        self.val_sampler = DistributedSampler(self.val_dataset,
-                                              shuffle=False,
-                                              num_replicas=world_size,
-                                              rank=rank,
-                                              drop_last=True)
-        self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=config.data.micro_batch_size_per_gpu,
-                                         sampler=self.val_sampler,
-                                         num_workers=8,
-                                         pin_memory=True,
-                                         drop_last=True)
+        self.val_dataloader = None
+        if self.val_dataset is not None:
+            self.val_sampler = DistributedSampler(self.val_dataset,
+                                                  shuffle=False,
+                                                  seed=config.trainer.seed,
+                                                  num_replicas=world_size,
+                                                  rank=rank,
+                                                  drop_last=config.data.get('drop_last', True))
+            self.val_dataloader = DataLoader(dataset=self.val_dataset,
+                                             batch_size=config.data.micro_batch_size_per_gpu,
+                                             sampler=self.val_sampler,
+                                             num_workers=8,
+                                             pin_memory=True,
+                                             drop_last=config.data.get('drop_last', True))
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -278,7 +288,7 @@ class FSDPSFTTrainer(object):
                                                             num_warmup_steps=num_warmup_steps,
                                                             num_training_steps=self.total_steps)
 
-    def _compute_loss_and_backward(self, batch, do_backward=True):
+    def _compute_loss_and_backward(self, batch, do_backward=True, loss_denominator=None, loss_scale=1.0):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
 
@@ -361,16 +371,14 @@ class FSDPSFTTrainer(object):
                     loss_mask = loss_mask.to(full_loss.device)
                     loss = full_loss * loss_mask
 
-                valid_token_this_rank = torch.sum(loss_mask)
-
-                if self.config.data.balance_dp_token:
-                    torch.distributed.all_reduce(valid_token_this_rank)
-                    dp_size = self.ulysses_device_mesh.size('dp') if use_sp else torch.distributed.get_world_size()
-                else:
-                    dp_size = 1
-
-                loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
-
+                denominator = loss_denominator
+                if denominator is None:
+                    denominator = torch.sum(loss_mask)
+                    if self.config.data.balance_dp_token:
+                        group = self.ulysses_device_mesh.get_group("dp")
+                        torch.distributed.all_reduce(denominator, group=group)
+                        loss_scale = self.ulysses_device_mesh.size("dp")
+                loss = torch.sum(loss) / (denominator + 1e-8) * loss_scale
                 if do_backward:
                     loss.backward()
                 return loss
@@ -384,12 +392,23 @@ class FSDPSFTTrainer(object):
 
         log_gpu_memory_usage('After optimizer zero_grad', logger=logger)
 
-        micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
-        n_micro_batches = len(micro_batches)
-        step_loss = 0
-        for micro_batch in micro_batches:
-            loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
+        actual_turns = batch.batch_size[0]
+        actual_tokens = batch["loss_mask"][:, :-1].sum().detach()
+        denominator = actual_tokens.clone()
+        scale = 1.0
+        if self.config.data.balance_dp_token:
+            torch.distributed.all_reduce(denominator, group=self.ulysses_device_mesh.get_group("dp"))
+            scale = self.ulysses_device_mesh.size("dp")
+        step_loss = 0.0
+        for micro_batch in batch.split(self.config.data.micro_batch_size_per_gpu):
+            loss = self._compute_loss_and_backward(
+                micro_batch, loss_denominator=denominator, loss_scale=scale,
+            )
             step_loss += loss.item()
+        counts = torch.tensor([actual_turns, int(actual_tokens.item())], device="cuda", dtype=torch.long)
+        torch.distributed.all_reduce(counts, group=self.ulysses_device_mesh.get_group("dp"))
+        self.processed_turns += int(counts[0].item())
+        self.supervised_tokens += int(counts[1].item())
 
         grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
 
@@ -401,6 +420,7 @@ class FSDPSFTTrainer(object):
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
+            self.optimizer_steps += 1
 
         log_gpu_memory_usage('After optimizer step', logger=logger)
 
@@ -413,7 +433,10 @@ class FSDPSFTTrainer(object):
 
         step_loss = torch.tensor(step_loss).cuda()
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-        return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3}
+        return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3,
+                'train/lr': lr, 'train/processed_turns': self.processed_turns,
+                'train/supervised_tokens': self.supervised_tokens,
+                'train/optimizer_steps': self.optimizer_steps}
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
@@ -439,72 +462,70 @@ class FSDPSFTTrainer(object):
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
         torch.distributed.barrier()
+        self.last_checkpoint = path
 
     def fit(self):
+        from omegaconf import OmegaConf
         rank = self.device_mesh.get_rank()
-
-        # TODO: add a unified tracking
-        if rank == 0:
-            tracking = Tracking(project_name=self.config.trainer.project_name,
-                                experiment_name=self.config.trainer.experiment_name,
-                                default_backend=self.config.trainer.logger)
-
+        tracking = None
         global_step = 0
-        # compute the total training steps.
-        # the total training steps in SFT is mainly for early exit
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
-        print(f'Total training steps: {self.total_training_steps}')
-
-        # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
-
-        for epoch in range(self.config.trainer.total_epochs):
-            self.train_sampler.set_epoch(epoch=epoch)
-            for data in tqdm(self.train_dataloader,
-                             total=self.steps_per_epoch,
-                             desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}"):
-                global_step += 1
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
-                metric = self.training_step(data)
-                if rank == 0:
-                    tracking.log(data=metric, step=global_step)
-
-                # for early exit validation
-                if global_step >= self.total_training_steps:
-                    # Perform final validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {'val/loss': avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
-                    torch.distributed.barrier()
-
-                    # Save final checkpoint
-                    self.save_checkpoint(step=global_step)
-                    return
-
-            # validation
-            val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
+        total_steps = self.config.trainer.total_training_steps or self.total_steps
+        if total_steps <= 0:
+            raise ValueError("SFT dataset produces no training batches")
+        try:
             if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {'val/loss': val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
-            torch.distributed.barrier()
-
-            # save checkpoint
-            self.save_checkpoint(step=global_step)
+                tracking = Tracking(
+                    project_name=self.config.trainer.project_name,
+                    experiment_name=self.config.trainer.experiment_name,
+                    default_backend=self.config.trainer.logger,
+                    config=OmegaConf.to_container(self.config, resolve=True),
+                    swanlab_kwargs=OmegaConf.to_container(self.config.trainer.swanlab_kwargs, resolve=True),
+                )
+                initial_metrics = {"data/num_turns": len(self.train_dataset)}
+                if self.config.data.num_trajectories is not None:
+                    initial_metrics["data/num_trajectories"] = self.config.data.num_trajectories
+                tracking.log(initial_metrics, step=0)
+            finished = False
+            for epoch in range(self.config.trainer.total_epochs):
+                self.train_sampler.set_epoch(epoch)
+                for data in tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}"):
+                    global_step += 1
+                    actual_size = data["input_ids"].shape[0]
+                    batch = TensorDict(data, batch_size=actual_size).cuda()
+                    metrics = self.training_step(batch)
+                    metrics["train/epoch"] = epoch + 1
+                    if tracking is not None:
+                        tracking.log(metrics, step=global_step)
+                    if global_step >= total_steps:
+                        finished = True
+                        break
+                if self.val_dataloader is not None:
+                    losses = []
+                    for data in self.val_dataloader:
+                        batch = TensorDict(data, batch_size=data["input_ids"].shape[0]).cuda()
+                        losses.append(self.validation_step(batch))
+                    if losses and tracking is not None:
+                        tracking.log({"val/loss": torch.stack(losses).mean().item()}, step=global_step)
+                self.save_checkpoint(global_step)
+                if finished:
+                    break
+            if rank == 0 and self.config.trainer.summary_path:
+                import json
+                from pathlib import Path
+                path = Path(self.config.trainer.summary_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "num_trajectories": self.config.data.num_trajectories,
+                    "num_turns": len(self.train_dataset),
+                    "processed_turns": self.processed_turns,
+                    "supervised_tokens": self.supervised_tokens,
+                    "optimizer_steps": self.optimizer_steps,
+                    "epochs": epoch + 1,
+                    "checkpoint": str(Path(self.last_checkpoint).resolve()),
+                }, indent=2), encoding="utf-8")
+        finally:
+            if tracking is not None:
+                tracking.finish()
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
