@@ -43,6 +43,7 @@ class RolloutRuntime:
         self.config = config
         self.role = role
         self.action_sampling = OmegaConf.to_container(sampling or settings.action, resolve=True)
+        self.action_chat_template_kwargs = dict(settings.get("chat_template_kwargs", {}))
         capacity = self.action_sampling["max_tokens"]
         if role == "teacher":
             capacity = max(capacity, settings.reflection.max_tokens)
@@ -63,7 +64,7 @@ class RolloutRuntime:
         self.collector = TrajectoryCollector(OmegaConf.create({
             "data": {"max_prompt_length": settings.prompt_length, "return_raw_chat": True},
             "env": {"max_steps": config.env.max_steps, "rollout": {"n": 1}},
-        }), self.tokenizer)
+        }), self.tokenizer, chat_template_kwargs=self.action_chat_template_kwargs)
         self.name_prefix = f"teaching_{role}_{next(_runtime_numbers)}"
         self.pool = RayResourcePool([settings.n_gpus], name_prefix=self.name_prefix, max_colocate_count=1)
         worker = RayClassWithInitArgs(ray.remote(ActorRolloutRefWorker), config=worker_config, role="rollout")
@@ -101,6 +102,7 @@ class RolloutRuntime:
         self.request_index = 0
         self.sampling = self.action_sampling
         try:
+            self.collector.chat_template_kwargs = self.action_chat_template_kwargs
             self.collector.vanilla_multi_turn_loop(
                 self.initial_batch(), self, envs,
                 reset_kwargs={
@@ -120,9 +122,14 @@ class RolloutRuntime:
         self.episode_seed, self.request_index = seed, 0
         from omegaconf import OmegaConf
         self.sampling = OmegaConf.to_container(self.config.teacher.reflection, resolve=True)
-        batch = self.collector.preprocess_batch(self.initial_batch(), {"text": [prompt], "anchor": [prompt]})
-        output = self.generate_sequences(batch)
-        return self.tokenizer.decode(output.batch["responses"][0], skip_special_tokens=True)
+        self.collector.chat_template_kwargs = dict(self.config.teacher.get("reflection_chat_template_kwargs", {}))
+        try:
+            batch = self.collector.preprocess_batch(self.initial_batch(), {"text": [prompt], "anchor": [prompt]})
+            output = self.generate_sequences(batch)
+            return self.tokenizer.decode(output.batch["responses"][0], skip_special_tokens=True)
+        finally:
+            self.sampling = self.action_sampling
+            self.collector.chat_template_kwargs = self.action_chat_template_kwargs
 
     def close(self):
         import ray

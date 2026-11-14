@@ -88,7 +88,8 @@ def collect(config):
     from .runtime import SequentialRollouts, make_environment
     root = Path(config.run.output_dir)
     manifest = read_jsonl(root / "manifest.jsonl")
-    ray_options = {"address": config.hardware.ray_address, "ignore_reinit_error": True}
+    ray_options = {"address": config.hardware.ray_address, "ignore_reinit_error": True,
+                   "runtime_env": {"env_vars": {"VLLM_USE_V1": "0"}}}
     if config.hardware.ray_address is None:
         ray_options["num_gpus"] = config.hardware.n_gpus
     ray.init(**ray_options)
@@ -208,7 +209,8 @@ def evaluate(config, model_path, label, manifests):
             by_split.setdefault(task["split"], []).append(task)
     if not by_split:
         raise ValueError("Provide at least one fixed evaluation manifest")
-    ray_options = {"address": config.hardware.ray_address, "ignore_reinit_error": True}
+    ray_options = {"address": config.hardware.ray_address, "ignore_reinit_error": True,
+                   "runtime_env": {"env_vars": {"VLLM_USE_V1": "0"}}}
     if config.hardware.ray_address is None:
         ray_options["num_gpus"] = config.hardware.n_gpus
     ray.init(**ray_options)

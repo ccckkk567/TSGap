@@ -20,7 +20,7 @@ tasks:
   split: train
   per_type: 5
   sample_seed: 42
-  data_root: ${paths.data}  # Contains json_2.1.1/ and logic/.
+  data_root: ${paths.data}/alfworld  # Contains json_2.1.1/ and logic/.
 env:
   env_name: alfworld/AlfredTWEnv
   config_path: agent_system/environments/env_package/alfworld/configs/config_tw.yaml
@@ -43,49 +43,59 @@ hardware:
   login_nodes: [orion-login01]
   ray_address: null
 teacher:
-  model_path: ???  # Absolute checkpoint path under paths.models.
+  model_path: ${paths.models}/Qwen3-14B
   n_gpus: ${hardware.n_gpus}
   tensor_parallel_size: 1
-  prompt_length: ???
+  prompt_length: 30720  # Plus the 2048-token reflection budget: 32768 total.
   gpu_memory_utilization: 0.5  # Existing veRL starting value; adjust for the chosen checkpoint.
+  chat_template_kwargs:
+    enable_thinking: true
+  reflection_chat_template_kwargs:
+    enable_thinking: false
   action:
-    max_tokens: 512
-    temperature: 0.7
-    top_p: 0.9
-    top_k: -1
+    max_tokens: 1024
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
   reflection:
     max_tokens: 2048
     temperature: 0.3
     top_p: 0.9
-    top_k: -1
+    top_k: 20
 student:
-  model_path: ???  # Absolute checkpoint path under paths.models.
+  model_path: ${paths.models}/Qwen3-4B
   n_gpus: ${hardware.n_gpus}
   tensor_parallel_size: 1
-  prompt_length: ???
+  prompt_length: 31744  # Plus the 1024-token action budget: 32768 total.
   gpu_memory_utilization: 0.5
+  chat_template_kwargs:
+    enable_thinking: true
   action:
-    max_tokens: 512
-    temperature: 0.7
-    top_p: 0.9
-    top_k: -1
+    max_tokens: 1024
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
 evaluation:
   manifests:
     - ${run.output_dir}/manifest_valid_seen.jsonl
     - ${run.output_dir}/manifest_valid_unseen.jsonl
   rollouts_per_task: 1
   sampling:
-    max_tokens: 512
-    temperature: 0.0  # Greedy decoding for initial/high/low.
-    top_p: 1.0
-    top_k: -1
+    max_tokens: 1024
+    temperature: 0.6  # Same action sampling for initial/high/low.
+    top_p: 0.95
+    top_k: 20
 sft:
   initial_model_path: ${student.model_path}
   n_gpus: ${hardware.n_gpus}
   sequence_parallel_size: 1
-  train_batch_size: ???
-  micro_batch_size_per_gpu: ???
-  learning_rate: 1e-5
+  train_batch_size: 4
+  micro_batch_size_per_gpu: 1
+  learning_rate: 1.0e-5
   epochs: 5
-  max_length: ???
+  max_length: ???  # Fill from the larger of the two exported data_summary.json maxima.
+  use_remove_padding: false
+  enable_gradient_checkpointing: true
+  chat_template_kwargs:
+    enable_thinking: true
   seed: 1

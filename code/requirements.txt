@@ -1,22 +1,40 @@
-# requirements.txt records the full set of dependencies for development
+# Install with: python -m pip install -c constraints.txt -r requirements.txt
+# Install flash-attn separately after Torch; see scripts/setup_env.sbatch.
+alfworld==0.4.2
+textworld[pddl]==1.6.2
+gymnasium==0.29.1
+requests
+pyyaml
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+vllm==0.8.5
+transformers==4.51.3
+huggingface-hub[hf_xet]
+tokenizers
+safetensors
+sentencepiece
 accelerate
 codetiming
 datasets
 dill
-flash-attn
 hydra-core
-liger-kernel
+omegaconf
 numpy
 pandas
 peft
 pyarrow>=15.0.0
 pybind11
 pylatexenc
-pylint==3.3.6
 ray[default]
-tensordict<=0.6.2
+tensordict
 torchdata
-transformers
-vllm==0.8.2
+opencv-python-headless
+einops
+psutil
+tqdm
+packaging
+termcolor
+pillow
 wandb
 swanlab

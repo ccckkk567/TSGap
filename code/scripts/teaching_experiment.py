@@ -49,11 +49,13 @@ def train(config, group):
         train_batch_size=config.sft.train_batch_size,
         micro_batch_size_per_gpu=config.sft.micro_batch_size_per_gpu,
         num_trajectories=summaries[0]["num_trajectories"],
+        chat_template_kwargs=dict(config.sft.get("chat_template_kwargs", {})),
     )
     training.model.partial_pretrain = config.sft.initial_model_path
+    training.model.enable_gradient_checkpointing = config.sft.enable_gradient_checkpointing
     training.optim.lr = config.sft.learning_rate
     training.ulysses_sequence_parallel_size = config.sft.sequence_parallel_size
-    training.use_remove_padding = True
+    training.use_remove_padding = config.sft.use_remove_padding
     training.trainer.update(
         total_epochs=config.sft.epochs, total_training_steps=None, seed=config.sft.seed,
         default_local_dir=str(directory / "checkpoints"), default_hdfs_dir=None,

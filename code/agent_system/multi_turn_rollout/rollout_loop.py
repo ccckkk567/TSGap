@@ -6,7 +6,6 @@ from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from transformers import PreTrainedTokenizer
 import uuid
-from verl.models.transformers.qwen2_vl import get_rope_index
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict, Tuple, Any, Optional, Union
@@ -14,7 +13,7 @@ from typing import List, Dict, Tuple, Any, Optional, Union
 from rlvmr import core_rlvmr
 
 class TrajectoryCollector:
-    def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
+    def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None, chat_template_kwargs=None):
         """
         Initialize the TrajectoryProcessor class.
         
@@ -26,6 +25,7 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
 
     def preprocess_single_sample(
         self,
@@ -77,7 +77,8 @@ class TrajectoryCollector:
         prompt_with_chat_template = self.tokenizer.apply_chat_template(
             chat,
             add_generation_prompt=True,
-            tokenize=False
+            tokenize=False,
+            **self.chat_template_kwargs,
         )
 
         # Initialize return dict
@@ -120,6 +121,7 @@ class TrajectoryCollector:
     
         if is_multi_modal:
 
+            from verl.models.transformers.qwen2_vl import get_rope_index
             position_ids = get_rope_index(
                 self.processor,
                 input_ids=input_ids[0],

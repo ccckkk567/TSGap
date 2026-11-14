@@ -51,7 +51,8 @@ def export_sft(run_dir):
                 )
                 answer = step["response"]
                 chat = tokenizer.apply_chat_template([dict(role="user", content=question)],
-                                                      tokenize=False, add_generation_prompt=True)
+                                                      tokenize=False, add_generation_prompt=True,
+                                                      **dict(config.sft.get("chat_template_kwargs", {})))
                 answer_length = len(tokenizer.encode(answer + tokenizer.eos_token, add_special_tokens=False))
                 lengths.append(len(tokenizer.encode(chat, add_special_tokens=False)) + answer_length)
                 target_lengths.append(answer_length)

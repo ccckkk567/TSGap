@@ -1,0 +1,22 @@
+# Preserve the existing ALFWorld environment.
+alfworld==0.4.2
+textworld==1.6.2
+gymnasium==0.29.1
+
+# Installation starting point; not yet validated on the allocated H200.
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+vllm==0.8.5
+transformers==4.51.3
+flash-attn==2.7.4.post1
+tensordict==0.6.2
+torchdata==0.11.0
+ray==2.43.0
+accelerate==1.6.0
+peft==0.15.2
+datasets==3.5.1
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+huggingface-hub>=0.30.0,<1.0
+tokenizers>=0.21.1,<0.22

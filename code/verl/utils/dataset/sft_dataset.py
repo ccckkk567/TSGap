@@ -65,6 +65,7 @@ class SFTDataset(Dataset):
         self.response_dict_keys = [] if not response_dict_keys else response_dict_keys
 
         self.max_length = max_length
+        self.chat_template_kwargs = dict(config.get('chat_template_kwargs', {}))
 
         self._download()
         self._read_files_and_tokenize()
@@ -120,7 +121,8 @@ class SFTDataset(Dataset):
         prompt_chat = [{'role': 'user', 'content': prompt}]
 
         # string
-        prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+        prompt_chat_str = tokenizer.apply_chat_template(
+            prompt_chat, add_generation_prompt=True, tokenize=False, **self.chat_template_kwargs)
         response_chat_str = response + tokenizer.eos_token
 
         # tokenize
