@@ -6,7 +6,7 @@ paths:
   outputs: ${paths.root}/outputs
   logs: ${paths.root}/logs
 run:
-  name: run01
+  name: run02
   output_dir: ${paths.outputs}/teaching/${run.name}
   generation_seed: 42
 logging:
@@ -43,7 +43,7 @@ hardware:
   login_nodes: [orion-login01]
   ray_address: null
 teacher:
-  model_path: ${paths.models}/Qwen3-14B
+  model_path: ${paths.models}/Qwen3-32B
   n_gpus: ${hardware.n_gpus}
   tensor_parallel_size: 1
   prompt_length: 30720  # Plus the 2048-token reflection budget: 32768 total.
@@ -63,7 +63,7 @@ teacher:
     top_p: 0.9
     top_k: 20
 student:
-  model_path: ${paths.models}/Qwen3-4B
+  model_path: ${paths.models}/Qwen3-8B
   n_gpus: ${hardware.n_gpus}
   tensor_parallel_size: 1
   prompt_length: 31744  # Plus the 1024-token action budget: 32768 total.

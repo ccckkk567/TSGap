@@ -55,18 +55,16 @@ installation. Actual versions are saved in `logs/env-before-JOBID.txt` and
 BF16 CUDA checks on one H200. Model loading and training remain to be verified.
 If installation fails, use the actual job error to adjust the affected package.
 
-After the installation job finishes successfully, download the two models:
+For `run02`, Qwen3-32B has been downloaded. Qwen3-8B availability still needs
+confirmation at `$ROOT/models/Qwen3-8B`. If needed, use the existing download job:
 
 ```bash
-sbatch "$SCRIPTS/download_models.sbatch"
-# If Qwen3-4B is already available, download only these Teacher checkpoints.
-sbatch "$SCRIPTS/download_models.sbatch" Qwen3-14B Qwen3-32B
+sbatch "$SCRIPTS/download_models.sbatch" Qwen3-8B
 ```
 
 The `alfworld` venv is used on `testqueue`, including downloads and CPU
 experiment stages. The download job uses `snapshot_download` to reuse available
-files. By default it downloads Qwen3-14B and Qwen3-4B to the configured paths.
-When model names are supplied, it downloads those Qwen checkpoints under
+files. Pass the model name explicitly to download that Qwen checkpoint under
 `paths.models` in `examples/teaching/config.yaml`.
 Provide Hugging Face / SwanLab credentials through your existing environment
 or login mechanism; never add keys or `dep-prep-credentials.env` to Git.
@@ -124,8 +122,9 @@ bash examples/rlvmr_trainer/run_sciworld.sh
 
 ### ALFWorld teaching experiment
 
-The shared `code/examples/teaching/config.yaml` selects Teacher Qwen3-14B,
-Student Qwen3-4B, `data/alfworld`, and one H200 with TP/SP=1. Teacher and Student
+The shared `code/examples/teaching/config.yaml` selects standard Qwen3-32B as
+Teacher and Qwen3-8B as Student, `data/alfworld`, and one H200 with TP/SP=1.
+Teacher and Student
 workers load sequentially and release their GPU resources on each switch.
 `common.sh` selects the existing venv and sets `VLLM_USE_V1=0` before imports;
 collection and evaluation also pass this setting into Ray workers.
@@ -134,24 +133,45 @@ Actions use thinking mode, a 1024-token budget and sampling
 (temperature 0.6, top_p 0.95, top_k 20). Reflection uses the unchanged English
 template with native thinking disabled and a 2048-token budget. The Teacher
 input budget is 30720 and Student input budget 31744. Overlong prompts fail
-instead of silently truncating demonstrations or feedback.
+instead of silently truncating demonstrations or feedback. SFT starts from
+Qwen3-8B and uses its tokenizer with `enable_thinking: true`.
 
-After model download completes, submit each stage below only after its
-prerequisites finish successfully. All commands below run on the login node
-and submit work to compute nodes. Resource limits can be overridden with
-`sbatch`; the run script defaults to four hours.
+The prompt encloses the complete Teacher example in a reference-demonstration
+block and presents the current episode separately. With a demonstration,
+it explicitly identifies the current history and observations as the source
+of the Student's actual state.
+
+`run02` creates fresh manifests, Teacher trajectories, Student rollouts and
+SwanLab state using the existing seeds. If `run02` already contains a different
+experiment on HPC, select the next unused `run.name` before submission.
+The 32B/8B combination still awaits validation through the actual single-H200
+collection job. Reflection is attempted after four Student rollouts, and
+oversized reflection inputs still raise the existing error with completed
+records retained.
+
+Once both model directories are ready and the old collection job has exited,
+sync on the login node and submit the existing one-hour `testqueue` job:
+
+```bash
+ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+git -C "$ROOT/code/TSGap" pull --ff-only
+sbatch --time=01:00:00 "$ROOT/scripts/collect.sbatch"
+```
+
+Inside the existing `collect.sbatch`, `CONFIG` points to
+`$ROOT/code/TSGap/code/examples/teaching/config.yaml`. The allocated job runs:
+
+```bash
+python -u -m scripts.teaching_experiment sample --config "$CONFIG" --split train
+python -u -m scripts.teaching_experiment sample --config "$CONFIG" --split valid_seen --all
+python -u -m scripts.teaching_experiment sample --config "$CONFIG" --split valid_unseen --all
+python -u -m scripts.teaching_experiment collect --config "$CONFIG"
+```
+
+After collection completes, the subsequent stages can be submitted separately:
 
 ```bash
 cd /scratch/prjsnnn0000269/Students/shuming/cjk/scripts
-# testqueue, CPU: fixed train list (six types, five tasks each).
-sbatch run_experiment.sbatch sample
-# Choose EVAL_TASKS_PER_TYPE before submission, or replace --per-type N with --all.
-sbatch run_experiment.sbatch sample --split valid_seen --per-type EVAL_TASKS_PER_TYPE
-sbatch run_experiment.sbatch sample --split valid_unseen --per-type EVAL_TASKS_PER_TYPE
-
-# testqueue: single-GPU collection, after all manifests are ready.
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch collect
-
 # testqueue, CPU: first select, then export after selection finishes.
 sbatch run_experiment.sbatch select
 sbatch run_experiment.sbatch export-sft
@@ -171,7 +191,7 @@ sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_exper
 sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch train --group low
 
 # Then evaluate initial/high/low sequentially on the same fixed lists.
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path /scratch/prjsnnn0000269/Students/shuming/cjk/models/Qwen3-4B --label initial
+sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path /scratch/prjsnnn0000269/Students/shuming/cjk/models/Qwen3-8B --label initial
 # Replace HIGH_CHECKPOINT and LOW_CHECKPOINT with the checkpoint paths recorded
 # in the respective sft/{high,low}/training_summary.json files.
 sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path HIGH_CHECKPOINT --label high
@@ -183,7 +203,7 @@ sbatch run_experiment.sbatch summarize
 Evaluation performs one sampled episode per task with the same action sampling
 for all three models and reports `valid_seen` and `valid_unseen` separately.
 Job logs are in `$ROOT/logs/tsgap-experiment-JOBID.out`; complete local records
-and SFT checkpoints are in `$ROOT/outputs/teaching/run01` by default.
+and SFT checkpoints are in `$ROOT/outputs/teaching/run02` by default.
 
 Logging remains `[console, swanlab]`. Use an existing SwanLab login or supply
 `SWANLAB_API_KEY` through the environment. The first real collection metrics

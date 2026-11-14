@@ -172,15 +172,34 @@ Valid actions: go to [recep id], take [obj id] from [recep id], put [obj id] in/
 Choose the most appropriate action from the valid actions.
 </action>
 """
+TEACHING_REFERENCE_TEMPLATE = """[REFERENCE DEMONSTRATION — SEPARATE EPISODE]
+
+The following is a successful reference execution.
+Its actions were performed in a separate episode, not in your current episode.
+
+Use it as guidance for solving the task. Do not treat its actions as actions
+you have already taken, and do not continue from its final state.
+
+{demonstration}
+
+[END OF REFERENCE DEMONSTRATION]"""
+
+TEACHING_EPISODE_SOURCE_NOTE = """Only the current episode's history and observations describe what you
+have actually done. The reference demonstration does not establish your
+current location, inventory, or task completion."""
+
 TEACHING_STEP_TEMPLATE = """You are acting in the ALFWorld household environment.
 Complete the task using the actual observations and admissible actions.
 At each step output exactly one concise <think>...</think> followed by
 one <action>...</action>. Choose an action from the current admissible actions.
 
 {context}
+[YOUR CURRENT EPISODE]
+
 Task: {task}
-Step: {step_index}
-Recent observation-action history:
+Current step: {step_index}
+
+Your recent observation-action history:
 {history}
 
 Current observation:
@@ -188,6 +207,8 @@ Current observation:
 
 Current admissible actions:
 {admissible_actions}
+
+{episode_source_note}
 """
 
 TEACHER_OBJECTIVE = """Complete the task in the real environment and produce a
@@ -206,13 +227,14 @@ def build_step_prompt(task, observation, admissible_actions, history, step_index
         )
     context = []
     if demonstration:
-        context.append(f"Complete demonstration:\n{demonstration}")
+        context.append(TEACHING_REFERENCE_TEMPLATE.format(demonstration=demonstration))
     if teacher_guidance:
         context.append(f"Execution guidance:\n{teacher_guidance}")
     return TEACHING_STEP_TEMPLATE.format(
         context="\n\n".join(context), task=task, step_index=step_index,
         history="\n".join(rendered_history) or "No previous actions.",
         observation=observation, admissible_actions="\n".join(admissible_actions),
+        episode_source_note=TEACHING_EPISODE_SOURCE_NOTE if demonstration else "",
     )
 
 
