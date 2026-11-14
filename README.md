@@ -59,11 +59,15 @@ After the installation job finishes successfully, download the two models:
 
 ```bash
 sbatch "$SCRIPTS/download_models.sbatch"
+# If Qwen3-4B is already available, download only these Teacher checkpoints.
+sbatch "$SCRIPTS/download_models.sbatch" Qwen3-14B Qwen3-32B
 ```
 
-This `ioqueue` job uses `snapshot_download` to reuse available files and stores
-Qwen3-14B and Qwen3-4B at the paths in `examples/teaching/config.yaml`, outside
-the repository. No rollout modules are imported by the download script.
+The `alfworld` venv is used on `testqueue`, including downloads and CPU
+experiment stages. The download job uses `snapshot_download` to reuse available
+files. By default it downloads Qwen3-14B and Qwen3-4B to the configured paths.
+When model names are supplied, it downloads those Qwen checkpoints under
+`paths.models` in `examples/teaching/config.yaml`.
 Provide Hugging Face / SwanLab credentials through your existing environment
 or login mechanism; never add keys or `dep-prep-credentials.env` to Git.
 
@@ -139,7 +143,7 @@ and submit work to compute nodes. Resource limits can be overridden with
 
 ```bash
 cd /scratch/prjsnnn0000269/Students/shuming/cjk/scripts
-# ioqueue: fixed train list (six types, five tasks each).
+# testqueue, CPU: fixed train list (six types, five tasks each).
 sbatch run_experiment.sbatch sample
 # Choose EVAL_TASKS_PER_TYPE before submission, or replace --per-type N with --all.
 sbatch run_experiment.sbatch sample --split valid_seen --per-type EVAL_TASKS_PER_TYPE
@@ -148,7 +152,7 @@ sbatch run_experiment.sbatch sample --split valid_unseen --per-type EVAL_TASKS_P
 # testqueue: single-GPU collection, after all manifests are ready.
 sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch collect
 
-# ioqueue: first select, then export after selection finishes.
+# testqueue, CPU: first select, then export after selection finishes.
 sbatch run_experiment.sbatch select
 sbatch run_experiment.sbatch export-sft
 ```
@@ -172,7 +176,7 @@ sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_exper
 # in the respective sft/{high,low}/training_summary.json files.
 sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path HIGH_CHECKPOINT --label high
 sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path LOW_CHECKPOINT --label low
-# ioqueue: after all evaluations finish.
+# testqueue, CPU: after all evaluations finish.
 sbatch run_experiment.sbatch summarize
 ```
 
