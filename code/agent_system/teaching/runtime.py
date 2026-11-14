@@ -51,6 +51,7 @@ class RolloutRuntime:
         worker_config = OmegaConf.load(base)
         worker_config.model.path = model_path or settings.model_path
         worker_config.rollout.update(
+            seed=int(config.run.generation_seed),
             n=1, prompt_length=settings.prompt_length, response_length=capacity,
             tensor_model_parallel_size=settings.tensor_parallel_size,
             gpu_memory_utilization=settings.gpu_memory_utilization,
