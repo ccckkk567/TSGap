@@ -13,19 +13,28 @@ data. Do not recreate the environment or run `alfworld-download` again.
 Installation, downloads and model work run in SLURM jobs; the login node is
 only used for syncing code and submitting jobs.
 
-On the login node:
+On the login node, sync the repository and copy its Slurm submission files to
+`$ROOT/scripts`. After pulling updates to the job files, copy them again. The
+jobs load `common.sh` and the experiment code from the repository.
 
 ```bash
 ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
 REPO="$ROOT/code/TSGap"
 CODE="$REPO/code"
-mkdir -p "$ROOT/code" "$ROOT/logs" "$ROOT/models" "$ROOT/outputs"
+SCRIPTS="$ROOT/scripts"
+mkdir -p "$ROOT/code" "$ROOT/logs" "$ROOT/models" "$ROOT/outputs" "$SCRIPTS"
 if [[ ! -d "$REPO/.git" ]]; then
     git clone https://github.com/ccckkk567/TSGap.git "$REPO"
 else
     git -C "$REPO" pull --ff-only
 fi
-sbatch "$CODE/scripts/setup_env.sbatch"
+cp -i "$CODE/scripts/"*.sbatch "$SCRIPTS/"
+```
+
+Submit the setup job from this directory when the environment needs installation:
+
+```bash
+sbatch "$SCRIPTS/setup_env.sbatch"
 squeue -u "$USER"
 # Replace JOBID with the submitted job ID:
 tail -f "$ROOT/logs/tsgap-env-JOBID.out"
@@ -42,15 +51,14 @@ while another job is using it.
 
 One final `pip check`, imports and a small BF16 CUDA operation confirm basic
 installation. Actual versions are saved in `logs/env-before-JOBID.txt` and
-`logs/env-after-JOBID.txt`. **These scripts have not yet been run on Orion;
-the version combination, model loading and training remain unverified there.**
+`logs/env-after-JOBID.txt`. Orion job `203043` passed the dependency, import and
+BF16 CUDA checks on one H200. Model loading and training remain to be verified.
 If installation fails, use the actual job error to adjust the affected package.
-`ENV_PACKAGES_OK` does not mean that model collection or SFT has passed.
 
 After the installation job finishes successfully, download the two models:
 
 ```bash
-sbatch "$CODE/scripts/download_models.sbatch"
+sbatch "$SCRIPTS/download_models.sbatch"
 ```
 
 This `ioqueue` job uses `snapshot_download` to reuse available files and stores
@@ -130,19 +138,19 @@ and submit work to compute nodes. Resource limits can be overridden with
 `sbatch`; the run script defaults to four hours.
 
 ```bash
-cd /scratch/prjsnnn0000269/Students/shuming/cjk/code/TSGap/code
+cd /scratch/prjsnnn0000269/Students/shuming/cjk/scripts
 # ioqueue: fixed train list (six types, five tasks each).
-sbatch scripts/run_experiment.sbatch sample
+sbatch run_experiment.sbatch sample
 # Choose EVAL_TASKS_PER_TYPE before submission, or replace --per-type N with --all.
-sbatch scripts/run_experiment.sbatch sample --split valid_seen --per-type EVAL_TASKS_PER_TYPE
-sbatch scripts/run_experiment.sbatch sample --split valid_unseen --per-type EVAL_TASKS_PER_TYPE
+sbatch run_experiment.sbatch sample --split valid_seen --per-type EVAL_TASKS_PER_TYPE
+sbatch run_experiment.sbatch sample --split valid_unseen --per-type EVAL_TASKS_PER_TYPE
 
 # testqueue: single-GPU collection, after all manifests are ready.
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 scripts/run_experiment.sbatch collect
+sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch collect
 
 # ioqueue: first select, then export after selection finishes.
-sbatch scripts/run_experiment.sbatch select
-sbatch scripts/run_experiment.sbatch export-sft
+sbatch run_experiment.sbatch select
+sbatch run_experiment.sbatch export-sft
 ```
 
 Set `sft.max_length` in the shared config to at least the larger of the two
@@ -155,17 +163,17 @@ counts are aligned. A changed established setting requires a new run directory.
 
 ```bash
 # testqueue: complete high before submitting low.
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 scripts/run_experiment.sbatch train --group high
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 scripts/run_experiment.sbatch train --group low
+sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch train --group high
+sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch train --group low
 
 # Then evaluate initial/high/low sequentially on the same fixed lists.
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 scripts/run_experiment.sbatch evaluate --model-path /scratch/prjsnnn0000269/Students/shuming/cjk/models/Qwen3-4B --label initial
+sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path /scratch/prjsnnn0000269/Students/shuming/cjk/models/Qwen3-4B --label initial
 # Replace HIGH_CHECKPOINT and LOW_CHECKPOINT with the checkpoint paths recorded
 # in the respective sft/{high,low}/training_summary.json files.
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 scripts/run_experiment.sbatch evaluate --model-path HIGH_CHECKPOINT --label high
-sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 scripts/run_experiment.sbatch evaluate --model-path LOW_CHECKPOINT --label low
+sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path HIGH_CHECKPOINT --label high
+sbatch --partition=testqueue --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1 run_experiment.sbatch evaluate --model-path LOW_CHECKPOINT --label low
 # ioqueue: after all evaluations finish.
-sbatch scripts/run_experiment.sbatch summarize
+sbatch run_experiment.sbatch summarize
 ```
 
 Evaluation performs one sampled episode per task with the same action sampling
