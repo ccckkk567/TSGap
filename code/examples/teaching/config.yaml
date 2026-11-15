@@ -43,7 +43,7 @@ hardware:
   login_nodes: [orion-login01]
   ray_address: null
 teacher:
-  model_path: ${paths.models}/Qwen3-32B
+  model_path: ${paths.models}/Qwen3-14B
   n_gpus: ${hardware.n_gpus}
   tensor_parallel_size: 1
   prompt_length: 30720  # Plus the 2048-token reflection budget: 32768 total.
@@ -63,7 +63,7 @@ teacher:
     top_p: 0.9
     top_k: 20
 student:
-  model_path: ${paths.models}/Qwen3-8B
+  model_path: ${paths.models}/Qwen3-4B
   n_gpus: ${hardware.n_gpus}
   tensor_parallel_size: 1
   prompt_length: 31744  # Plus the 1024-token action budget: 32768 total.
