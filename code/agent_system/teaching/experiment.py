@@ -88,6 +88,31 @@ def collect(config):
     from .runtime import SequentialRollouts, make_environment
     root = Path(config.run.output_dir)
     manifest = read_jsonl(root / "manifest.jsonl")
+    target_path = root / "student_targets.jsonl"
+    if not target_path.exists():
+        raise FileNotFoundError(f"Missing Student targets: {target_path}. Run sample --split train first.")
+    sources = {task["task_id"]: task for task in manifest}
+    source_files = {task["game_file"] for task in manifest}
+    student_targets, target_files = {}, set()
+    expected_keys = {(task["task_id"], i) for task in manifest
+                     for i in range(config.teaching.student_rollouts)}
+    for row in read_jsonl(target_path):
+        key = (row["source_task_id"], row["rollout_index"])
+        if key in student_targets:
+            raise ValueError(f"Duplicate Student target mapping: {key}")
+        if key not in expected_keys:
+            raise ValueError(f"Unexpected Student target mapping: {key}")
+        if row["split"] != "train" or row["task_type"] != sources[row["source_task_id"]]["task_type"]:
+            raise ValueError(f"Student target must be a train instance of the source task type: {key}")
+        if row["game_file"] in source_files:
+            raise ValueError(f"Student target overlaps a Teacher source: {row['game_file']}")
+        if row["game_file"] in target_files:
+            raise ValueError(f"Duplicate Student target game: {row['game_file']}")
+        student_targets[key] = row
+        target_files.add(row["game_file"])
+    missing = expected_keys - student_targets.keys()
+    if missing:
+        raise ValueError(f"Missing Student target mappings: {sorted(missing)}")
     ray_options = {"address": config.hardware.ray_address, "ignore_reinit_error": True,
                    "runtime_env": {"env_vars": {"VLLM_USE_V1": "0"}}}
     if config.hardware.ray_address is None:
@@ -137,8 +162,9 @@ def collect(config):
                 (directory / "demo.txt").write_text(demonstration, encoding="utf-8")
                 episodes = []
                 for rollout_index in range(config.teaching.student_rollouts):
+                    target_task = student_targets[(task["task_id"], rollout_index)]
                     episode, new = run_episode(
-                        lambda: models.activate("student"), envs, config, task, directory / f"student_{rollout_index}.json",
+                        lambda: models.activate("student"), envs, config, target_task, directory / f"student_{rollout_index}.json",
                         task_index, version, rollout_index=rollout_index, demonstration=demonstration,
                     )
                     episodes.append(episode)

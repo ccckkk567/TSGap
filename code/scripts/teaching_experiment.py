@@ -99,13 +99,17 @@ def main():
         if hostname in config.hardware.login_nodes:
             parser.error(f"GPU work must run on an allocated compute node, not {hostname}")
     if args.command == "sample":
-        from agent_system.teaching.tasks import sample_tasks
+        from agent_system.teaching.tasks import sample_tasks, sample_student_targets
         split = args.split or config.tasks.split
         output = args.output or str(Path(config.run.output_dir) / ("manifest.jsonl" if split == "train" else f"manifest_{split}.jsonl"))
         if split != "train" and Path(output).resolve() == (Path(config.run.output_dir) / "manifest.jsonl").resolve():
             parser.error("Evaluation sampling must not overwrite the teaching manifest")
         rows = sample_tasks(config, split, output, args.per_type or config.tasks.per_type, args.all)
         print(f"Fixed manifest: {output} ({len(rows)} tasks)")
+        if split == "train" and Path(output).resolve() == (Path(config.run.output_dir) / "manifest.jsonl").resolve():
+            target_output = Path(config.run.output_dir) / "student_targets.jsonl"
+            targets = sample_student_targets(config, rows, target_output)
+            print(f"Fixed Student targets: {target_output} ({len(targets)} tasks)")
     elif args.command in ("select", "export-sft"):
         from agent_system.teaching.sft_data import select_pairs, export_sft
         if args.command == "select":

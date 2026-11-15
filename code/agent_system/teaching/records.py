@@ -88,7 +88,10 @@ def render_feedback(episodes):
     parts = []
     for episode in episodes:
         parts.append(f"Rollout {episode['rollout_index']}: success={episode['success']}, "
-                     f"termination={episode['termination_reason']}, steps={episode['num_steps']}")
+                     f"termination={episode['termination_reason']}, steps={episode['num_steps']}\n"
+                     f"Student task: {episode['task']}\n"
+                     f"Task type: {episode['task_type']}\n"
+                     f"Game file: {episode['game_file']}")
         for step in episode["steps"]:
             parts.append(
                 f"Step {step['step']}\nObservation: {step['observation']}\n"

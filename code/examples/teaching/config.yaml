@@ -6,7 +6,7 @@ paths:
   outputs: ${paths.root}/outputs
   logs: ${paths.root}/logs
 run:
-  name: run02
+  name: run03
   output_dir: ${paths.outputs}/teaching/${run.name}
   generation_seed: 42
 logging:

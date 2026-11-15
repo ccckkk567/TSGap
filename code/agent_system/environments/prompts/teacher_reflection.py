@@ -2,14 +2,16 @@
 
 TEACHER_REFLECTION_TEMPLATE = """You are a Teacher generating teaching trajectories for a fixed Student model.
 
-Your current teaching trajectory has successfully completed the task in the ALFWorld environment. The Student used this complete trajectory as an in-context learning (ICL) demonstration and independently attempted the same task several times, each time starting from the same initial environment state. Below are the current demonstration, the Student's actual execution results, and the existing records of teaching iterations.
+Your current teaching trajectory has successfully completed a source task in the ALFWorld environment. The Student used this complete trajectory as an in-context learning (ICL) demonstration to attempt four distinct task instances of the same ALFWorld task type. Each Student attempt started from its own target task's initial environment state. Below are the source demonstration, the Student's actual execution results on the target tasks, and the existing records of teaching iterations.
 
 Your objective:
-Use the Student's actual behavior to determine which parts of the current demonstration are worth preserving and which may need adjustment. Provide guidance for generating the next teaching trajectory through a new execution of the task.
+Use the Student's actual behavior to determine which parts of the current demonstration are worth preserving and which may need adjustment. Provide guidance for generating the next teaching trajectory through a new execution of the source task.
 
 You are not directly correcting an unfinished Student attempt, nor are you merely seeking a shorter or more elegant solution for yourself. The current feedback measures the Student's task performance while using the demonstration, not learning gains after parameter training.
 
 [How the Student actually uses the demonstration]
+
+The Teacher demonstration describes the source task, not the Student's target task. Judge each rollout against its actual target task and observations. Do not assume object locations, object identifiers, or actions completed in the Teacher's source episode are facts about the Student's target episode. Different valid solution paths are not errors.
 
 At every step, the Student sees:
 - The complete current Teacher demonstration.
@@ -54,7 +56,7 @@ Use previous iterations to identify changes worth retaining and changes that sho
 
 If the current results do not provide a clear basis for improvement, say so directly. If all attempts succeeded, do not invent failures or claim that generalization has been established. If all attempts failed, do not immediately conclude that the Student cannot complete the task. You may recommend preserving the existing approach or propose a tentative adjustment whose usefulness remains to be examined through subsequent results.
 
-Next, the Teacher will restart the same task from its initial environment state and execute it again in the real environment. Your guidance must be realizable through the actions and explanations in that execution. Do not fabricate observations, require deliberate failures to demonstrate recovery, or pass the outer-loop feedback or this reflection directly to the Student as additional hints.
+Next, the Teacher will restart the source task from its initial environment state and execute it again in the real environment. Your guidance must be realizable through the actions and explanations in that execution. Do not fabricate observations, require deliberate failures to demonstrate recovery, or pass the outer-loop feedback or this reflection directly to the Student as additional hints.
 
 The new demonstration must be understandable on its own, without depending on statements such as "based on the Student's earlier mistake." Do not present facts from old logs as though they have already been observed in the new execution. Any state that needs confirmation should be assessed using real information from the new execution.
 

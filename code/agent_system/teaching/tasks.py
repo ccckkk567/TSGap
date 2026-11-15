@@ -32,17 +32,22 @@ def environment_config(config):
     return root, result
 
 
-def sample_tasks(config, split, output, per_type=5, all_tasks=False):
+def _group_game_files(config, split):
     from agent_system.environments.env_package.alfworld.alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
-    output = Path(output)
-    if output.exists():
-        return read_jsonl(output)
     root, settings = environment_config(config)
     pool = AlfredTWEnv(settings, train_eval=SPLITS[split]).game_files
     groups = {kind: [] for kind in TASK_TYPES}
     for path in sorted(Path(p).resolve().relative_to(root).as_posix() for p in pool):
         kind = read_json((root / path).parent / "traj_data.json")["task_type"]
         groups[kind].append(path)
+    return groups
+
+
+def sample_tasks(config, split, output, per_type=5, all_tasks=False):
+    output = Path(output)
+    if output.exists():
+        return read_jsonl(output)
+    groups = _group_game_files(config, split)
     rng = random.Random(config.tasks.sample_seed)
     rows = []
     for kind, paths in groups.items():
@@ -52,5 +57,32 @@ def sample_tasks(config, split, output, per_type=5, all_tasks=False):
                              split=split, game_file=path))
     if not rows:
         raise ValueError("No ALFWorld tasks found. Check tasks.data_root.")
+    write_jsonl(output, rows)
+    return rows
+
+
+def sample_student_targets(config, teacher_tasks, output):
+    output = Path(output)
+    if output.exists():
+        return read_jsonl(output)
+    groups = _group_game_files(config, "train")
+    n = config.teaching.student_rollouts
+    source_files = {row["game_file"] for row in teacher_tasks}
+    rng = random.Random(config.tasks.sample_seed + 1)
+    rows = []
+    for kind in TASK_TYPES:
+        source_group = [task for task in teacher_tasks if task["task_type"] == kind]
+        available = [path for path in groups[kind] if path not in source_files]
+        required = len(source_group) * n
+        if len(available) < required:
+            raise ValueError(f"Not enough Student targets for {kind}: need {required}, have {len(available)}")
+        selected = rng.sample(available, required)
+        for i, source in enumerate(source_group):
+            for rollout_index in range(n):
+                rows.append(dict(
+                    source_task_id=source["task_id"], rollout_index=rollout_index,
+                    task_id=f"icl_{source['task_id']}_{rollout_index}", task_type=kind,
+                    split="train", game_file=selected[i * n + rollout_index],
+                ))
     write_jsonl(output, rows)
     return rows
