@@ -148,10 +148,11 @@ class RolloutRuntime:
         for group in groups:
             remove_placement_group(group)
         # Ray teardown is asynchronous. Wait before allocating the next model.
+        ray_address = ray.get_runtime_context().gcs_address
         deadline = time.monotonic() + 30
         while True:
             actors_done = all(
-                (get_actor(worker._actor_id.hex()) or {}).get("state", "DEAD") == "DEAD"
+                (get_actor(worker._actor_id.hex(), address=ray_address) or {}).get("state", "DEAD") == "DEAD"
                 for worker in workers
             )
             groups_done = all(placement_group_table(group).get("state") == "REMOVED" for group in groups)
