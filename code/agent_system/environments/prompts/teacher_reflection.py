@@ -9,6 +9,8 @@ Use the Student's actual behavior to determine which parts of the current demons
 
 You are not directly correcting an unfinished Student attempt, nor are you merely seeking a shorter or more elegant solution for yourself. The current feedback measures the Student's task performance while using the demonstration, not learning gains after parameter training.
 
+The four behavioral analyses were produced independently, one per target Student rollout, without access to the Teacher demonstration or other Student rollouts. Each analysis describes execution evidence and possible behavioral interpretations, not a final judgment of teaching quality. Some analyses may be based on a truncated suffix of the original execution; the visible-step coverage is stated with each analysis. Do not assume that an omitted step was inspected or invent evidence about omitted steps.
+
 [How the Student actually uses the demonstration]
 
 The Teacher demonstration describes the source task, not the Student's target task. Judge each rollout against its actual target task and observations. Do not assume object locations, object identifiers, or actions completed in the Teacher's source episode are facts about the Student's target episode. Different valid solution paths are not errors.
@@ -34,21 +36,27 @@ The object you may change is the Teacher's next teaching trajectory. Do not prop
 [Student results for this round]
 {rollout_results}
 
-[Complete Student execution records for this round]
-{student_rollout_records}
+[Independent Student behavioral analyses for this round]
+{student_rollout_analyses}
 
 [Records of previous teaching iterations]
 {previous_round_records}
 
 [Reflection requirements]
 
-Base your assessment on both the demonstration and the actual execution records, not only on the aggregate success rate.
+Base your assessment on both the demonstration and the execution evidence in the independent analyses, not only on the aggregate success rate.
+
+Do not evaluate teaching effectiveness solely from the aggregate success rate. Even if all Student rollouts succeeded, inspect the analyses for meaningful errors, unnecessary actions, state inconsistencies, and ineffective decisions. Even if all rollouts failed, identify useful and correct substeps as well as important difficulties. Do not invent problems merely to justify a change.
+
+Compare the four target-instance analyses, rather than merely repeating or concatenating them. Distinguish recurring patterns from instance-specific difficulties. For each important issue, check what the current complete Teacher demonstration actually shows or explains, and what it does not. Distinguish evidence from speculation about teaching limitations; do not assume every Student failure was caused by the demonstration.
+
+Provide specific, self-contained guidance about what to retain or change in the NEXT real execution of the source task and why it might help the Student. Do not require fabricated observations or scripted failures, and do not force changes when the evidence is insufficient.
 
 Focus on important behaviors supported by the records, and cite rollout identifiers and relevant steps. Compare useful differences between unsuccessful and successful attempts. If either kind of attempt is absent, do not invent a comparison. A path that differs from the Teacher's path is not, by itself, an error.
 
 For each issue you consider important, check whether the current demonstration already provides the relevant information. Distinguish directly observed behavior from a possible explanation involving a limitation of the teaching material. Do not conclude from a small number of results that the Student lacks a particular capability, and do not assume that every failure was caused by the current demonstration.
 
-Make recommendations based on what the Student could actually see at the relevant step. You can inspect the complete logs, but you must not assume the Student could also see the complete logs at that time. Do not interpret system execution errors as evidence of a Student capability problem.
+Make recommendations based on what the Student could actually see at the relevant step. You are given the independent behavioral analyses and their evidence references, not the full raw Student logs. Use the provided evidence and coverage notices faithfully. Do not claim to have verified omitted raw steps. The Student itself had access to at most two recent turns of its own history at each decision; do not assume it could see the whole past execution. Do not interpret system execution errors as evidence of a Student capability problem.
 
 The next version may change explanations, the organization of steps, or a valid execution path. Adding, removing, simplifying, or reorganizing content is allowed, but changes should relate to the observed issues. Do not assume that more length, more detail, or more checks are necessarily more effective. Do not force changes to parts that already work merely to make the trajectory different.
 

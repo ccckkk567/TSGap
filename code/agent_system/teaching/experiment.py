@@ -1,12 +1,100 @@
 """Serial teaching, independent evaluation, and summaries of local records."""
 import csv
 import json
+import re
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from statistics import mean
 from .records import (
     read_json, write_json, read_jsonl, completed_episode, render_feedback,
 )
+
+ANALYSIS_SEED_OFFSET = 1_000_000
+LAST_STEPS_ON_OVERFLOW = 30
+
+
+def reflection_input_length(runtime, prompt, config):
+    rendered = runtime.tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+        **dict(config.teacher.reflection_chat_template_kwargs),
+    )
+    return len(runtime.tokenizer(rendered, add_special_tokens=False)["input_ids"])
+
+
+def build_analysis_request(runtime, episode, config):
+    """Fit one rollout by omitting only complete early steps when necessary."""
+    from agent_system.environments.prompts.teacher_rollout_analysis import TEACHER_ROLLOUT_ANALYSIS_TEMPLATE
+
+    def render(steps):
+        first, last = steps[0]["step"], steps[-1]["step"]
+        omitted = f"1–{first - 1}" if first > 1 else "none"
+        coverage = (
+            f"Rollout {episode['rollout_index']}; Student task: {episode['task']}; "
+            f"Task type: {episode['task_type']}; Game file: {episode['game_file']}; "
+            f"total steps={episode['num_steps']}; visible steps={first}–{last}; "
+            f"omitted={omitted}; success={episode['success']}\n"
+        )
+        if first == 1:
+            coverage += f"All steps 1–{last} are provided. No steps were omitted."
+        else:
+            coverage += (
+                f"[Truncation Notice]\nThe original Student execution contains {episode['num_steps']} steps, "
+                f"but only steps {first}–{last} are provided because the prompt exceeded the context limit. "
+                f"Steps 1–{first - 1} are omitted.\n"
+                "The initial observation, task identity, and final outcome are shown separately. "
+                "Do not treat the visible suffix as the entire execution or invent observations, reasoning, "
+                "actions, or outcomes for omitted steps. Base all detailed claims on the steps actually provided."
+            )
+        prompt = TEACHER_ROLLOUT_ANALYSIS_TEMPLATE.format(
+            max_steps=config.env.max_steps, coverage_notice=coverage,
+            student_execution_record=render_feedback([dict(episode, steps=steps)]),
+        )
+        return prompt, coverage
+
+    prompt, coverage = render(episode["steps"])
+    if reflection_input_length(runtime, prompt, config) <= config.teacher.prompt_length:
+        return prompt, coverage
+    steps = episode["steps"][-LAST_STEPS_ON_OVERFLOW:]
+    while True:
+        prompt, coverage = render(steps)
+        length = reflection_input_length(runtime, prompt, config)
+        if length <= config.teacher.prompt_length:
+            return prompt, coverage
+        if len(steps) == 1:
+            raise ValueError(
+                f"Analysis for rollout {episode['rollout_index']} exceeds prompt_length even with only "
+                f"the last complete step: {length} > {config.teacher.prompt_length}"
+            )
+        steps = steps[1:]
+
+
+def validate_analysis(text):
+    sections = re.split(r"(?m)^## ([^\r\n]+)\r?$", text)
+    expected = ["Execution Overview", "Chronological Execution Trace", "Key Decisions and Evidence",
+                "Recurring Behavioral Patterns", "Uncertainties and Limitations"]
+    if [heading.strip() for heading in sections[1::2]] != expected or any(
+        not body.strip() for body in sections[2::2]
+    ):
+        raise ValueError("Student analysis is incomplete: expected all five sections with nonempty bodies.")
+
+
+def analyze_student_episode(runtime, episode, directory, seed, config):
+    """Reuse a valid analysis or save one independent Teacher generation."""
+    index = episode["rollout_index"]
+    path = directory / f"analysis_{index}.txt"
+    request_path = directory / f"analysis_{index}_request.txt"
+    if path.exists():
+        analysis = path.read_text(encoding="utf-8")
+        validate_analysis(analysis)
+        request = request_path.read_text(encoding="utf-8")
+        coverage = request.split("[Execution coverage]\n", 1)[1].split("\n\n[Student execution record]", 1)[0]
+        return analysis, coverage
+    prompt, coverage = build_analysis_request(runtime, episode, config)
+    request_path.write_text(prompt, encoding="utf-8")
+    analysis = runtime.reflect(prompt, seed)
+    validate_analysis(analysis)
+    path.write_text(analysis, encoding="utf-8")
+    return analysis, coverage
 
 
 @contextmanager
@@ -200,23 +288,39 @@ def collect(config):
                 reflection_path = directory / "reflection.txt"
                 if reflection_path.exists():
                     reflection = reflection_path.read_text(encoding="utf-8")
+                    guidance = extract_guidance(reflection)
                 else:
+                    teacher_runtime = models.activate("teacher")
+                    reflection_slot = config.teaching.max_teacher_attempts + config.teaching.student_rollouts
+                    reflection_seed = generation_seed(config, task_index, version, reflection_slot)
+                    analysis_blocks = []
+                    for episode in episodes:
+                        i = episode["rollout_index"]
+                        analysis, coverage = analyze_student_episode(
+                            teacher_runtime, episode, directory,
+                            reflection_seed + ANALYSIS_SEED_OFFSET + i, config,
+                        )
+                        analysis_blocks.append(f"[Rollout {i}: analysis coverage and task identity]\n{coverage}\n\n{analysis}")
+                    target_results = [{key: episode[key] for key in
+                                       ("rollout_index", "task", "task_type", "game_file", "success", "num_steps")}
+                                      for episode in episodes]
                     prompt = TEACHER_REFLECTION_TEMPLATE.format(
                         task_and_execution_settings=json.dumps(dict(
                             task=accepted["task"], max_steps=config.env.max_steps,
                             history_length=2, student_generation=OmegaConf.to_container(config.student.action, resolve=True),
                         ), ensure_ascii=False),
                         trajectory_version=version, current_demonstration_text=demonstration,
-                        rollout_results=json.dumps(result), student_rollout_records=render_feedback(episodes),
+                        rollout_results=json.dumps(dict(result, target_results=target_results), ensure_ascii=False),
+                        student_rollout_analyses="\n\n".join(analysis_blocks),
                         previous_round_records=json.dumps(previous, ensure_ascii=False),
                     )
                     (directory / "reflection_request.txt").write_text(prompt, encoding="utf-8")
-                    reflection_slot = config.teaching.max_teacher_attempts + config.teaching.student_rollouts
-                    reflection = models.activate("teacher").reflect(
-                        prompt, generation_seed(config, task_index, version, reflection_slot),
-                    )
+                    length = reflection_input_length(teacher_runtime, prompt, config)
+                    if length > config.teacher.prompt_length:
+                        raise ValueError(f"Global Reflection input exceeds prompt_length: {length} > {config.teacher.prompt_length}")
+                    reflection = teacher_runtime.reflect(prompt, reflection_seed)
+                    guidance = extract_guidance(reflection)
                     reflection_path.write_text(reflection, encoding="utf-8")
-                guidance = extract_guidance(reflection)
                 write_json(directory / "guidance.json", {"guidance": guidance, "from_version": version})
                 previous.append(dict(version=version, result=result, reflection=reflection))
 

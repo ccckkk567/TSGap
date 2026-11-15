@@ -91,13 +91,15 @@ def render_feedback(episodes):
                      f"termination={episode['termination_reason']}, steps={episode['num_steps']}\n"
                      f"Student task: {episode['task']}\n"
                      f"Task type: {episode['task_type']}\n"
-                     f"Game file: {episode['game_file']}")
+                     f"Game file: {episode['game_file']}\n"
+                     f"Initial observation: {episode['initial_observation']}")
         for step in episode["steps"]:
             parts.append(
                 f"Step {step['step']}\nObservation: {step['observation']}\n"
                 f"Admissible actions: {step['admissible_actions']}\n"
                 f"Response: {step['response']}\nAction: {step['action']}\n"
                 f"Environment returned: {step['next_observation']}\n"
-                f"Reward: {step['reward']}; done={step['done']}; won={step['won']}"
+                f"Reward: {step['reward']}; done={step['done']}; won={step['won']}; "
+                f"format_valid={step['format_valid']}; action_available={step['action_available']}"
             )
     return "\n\n".join(parts)
