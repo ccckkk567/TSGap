@@ -78,9 +78,10 @@ def train(config, group):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["sample", "collect", "select", "export-sft", "train", "evaluate", "summarize"])
+    parser.add_argument("command", choices=["sample", "collect", "baseline", "select", "export-sft", "train", "evaluate", "summarize"])
     parser.add_argument("--config", default="examples/teaching/config.yaml")
     parser.add_argument("--run-dir")
+    parser.add_argument("--task-id")
     parser.add_argument("--split", choices=["train", "valid_seen", "valid_unseen"])
     parser.add_argument("--output")
     parser.add_argument("--per-type", type=int)
@@ -94,7 +95,7 @@ def main():
     os.chdir(Path(__file__).resolve().parents[1])
     config_path = Path(args.run_dir) / "config.yaml" if args.run_dir else Path(args.config)
     config = load_config(config_path)
-    if args.command in ("collect", "train", "evaluate"):
+    if args.command in ("collect", "baseline", "train", "evaluate"):
         hostname = socket.gethostname().split(".")[0]
         if hostname in config.hardware.login_nodes:
             parser.error(f"GPU work must run on an allocated compute node, not {hostname}")
@@ -121,9 +122,13 @@ def main():
             parser.error("train requires --group high or low")
         train(config, args.group)
     else:
-        from agent_system.teaching.experiment import collect, evaluate, summarize
+        from agent_system.teaching.experiment import collect, baseline_no_icl, evaluate, summarize
         if args.command == "collect":
             collect(config)
+        elif args.command == "baseline":
+            if not args.task_id:
+                parser.error("baseline requires --task-id")
+            baseline_no_icl(config, args.task_id)
         elif args.command == "evaluate":
             if not args.model_path or not args.label:
                 parser.error("evaluate requires --model-path and --label")

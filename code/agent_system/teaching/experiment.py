@@ -221,6 +221,72 @@ def collect(config):
                 previous.append(dict(version=version, result=result, reflection=reflection))
 
 
+def baseline_no_icl(config, task_id):
+    import ray
+    from .runtime import RolloutRuntime, make_environment
+    root = Path(config.run.output_dir)
+    manifest = read_jsonl(root / "manifest.jsonl")
+    task_index = next((i for i, task in enumerate(manifest) if task["task_id"] == task_id), None)
+    if task_index is None:
+        raise ValueError(f"Source task not found in manifest.jsonl: {task_id}")
+    targets = sorted(
+        (row for row in read_jsonl(root / "student_targets.jsonl") if row["source_task_id"] == task_id),
+        key=lambda row: row["rollout_index"],
+    )
+    if [row["rollout_index"] for row in targets] != [0, 1, 2, 3]:
+        raise ValueError(f"No-ICL baseline requires exactly rollout indices 0, 1, 2, 3 for {task_id}")
+    icl_result = read_json(root / task_id / "v000" / "result.json")
+    directory = root / "baselines" / "no_icl" / task_id
+    ray_options = {"address": config.hardware.ray_address, "ignore_reinit_error": True,
+                   "runtime_env": {"env_vars": {"VLLM_USE_V1": "0"}}}
+    if config.hardware.ray_address is None:
+        ray_options["num_gpus"] = config.hardware.n_gpus
+    ray.init(**ray_options)
+    with ExitStack() as stack:
+        stack.callback(ray.shutdown)
+        log = stack.enter_context(phase_tracking(
+            config, f"baseline-no-icl-{task_id}",
+            extra={"condition": "no_icl", "source_task_id": task_id},
+        ))
+        envs = make_environment(config)
+        stack.callback(envs.envs.close)
+        student_runtime = RolloutRuntime(config, "student")
+        stack.callback(student_runtime.close)
+        episodes = []
+        print(f"No-ICL baseline: {task_id}", flush=True)
+        for target_task in targets:
+            rollout_index = target_task["rollout_index"]
+            episode, new = run_episode(
+                lambda: student_runtime, envs, config, target_task,
+                directory / f"student_{rollout_index}.json",
+                task_index=task_index, version=0, rollout_index=rollout_index,
+                demonstration="", guidance="",
+            )
+            episodes.append(episode)
+            print(f"Student {rollout_index}: success={episode['success']}, "
+                  f"steps={episode['num_steps']}, seed={episode['generation_settings']['seed']}", flush=True)
+            if new:
+                log({"progress/rollout_index": rollout_index,
+                     "baseline_no_icl/rollout_success": int(episode["success"]),
+                     "baseline_no_icl/rollout_steps": episode["num_steps"]})
+        result = dict(
+            condition="no_icl", source_task_id=task_id, compared_icl_version=0,
+            success_flags=[int(e["success"]) for e in episodes],
+            success_count=sum(e["success"] for e in episodes), num_rollouts=len(episodes),
+            success_rate=mean(e["success"] for e in episodes),
+            steps=[e["num_steps"] for e in episodes],
+            mean_steps=mean(e["num_steps"] for e in episodes),
+        )
+        successful = [e["num_steps"] for e in episodes if e["success"]]
+        if successful:
+            result["success_mean_steps"] = mean(successful)
+        write_json(directory / "result.json", result)
+        log({f"baseline_no_icl/{key}": result[key] for key in ("success_count", "success_rate")})
+        print(f"\nNo-ICL SR: {result['success_count']}/{result['num_rollouts']} = {result['success_rate']}", flush=True)
+        print(f"ICL v000 SR: {icl_result['success_count']}/{icl_result['num_rollouts']} = {icl_result['success_rate']}", flush=True)
+        print(f"Delta SR (ICL - No-ICL): {icl_result['success_rate'] - result['success_rate']}", flush=True)
+
+
 def evaluate(config, model_path, label, manifests):
     import ray
     from omegaconf import OmegaConf
