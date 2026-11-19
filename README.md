@@ -37,7 +37,7 @@ CHECKPOINT_ROOT=/scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpo
 mkdir -p "$ROOT/logs" "$ROOT/outputs/teaching" "$CHECKPOINT_ROOT"
 
 bc_job=$(sbatch --parsable \
-  --job-name=tsgap-bc --time=06:00:00 \
+  --job-name=tsgap-bc --time=08:00:00 \
   --partition=testqueue --gres=gpu:1 \
   --export=ALL,TSGAP_GPU_JOB=1 \
   "$CODE/scripts/run_experiment.sbatch" \
