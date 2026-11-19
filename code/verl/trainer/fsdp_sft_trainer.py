@@ -514,7 +514,9 @@ class FSDPSFTTrainer(object):
                 from pathlib import Path
                 path = Path(self.config.trainer.summary_path)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps({
+                temporary = path.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps({
+                    "status": "complete",
                     "num_trajectories": self.config.data.num_trajectories,
                     "num_turns": len(self.train_dataset),
                     "processed_turns": self.processed_turns,
@@ -523,6 +525,7 @@ class FSDPSFTTrainer(object):
                     "epochs": epoch + 1,
                     "checkpoint": str(Path(self.last_checkpoint).resolve()),
                 }, indent=2), encoding="utf-8")
+                temporary.replace(path)
         finally:
             if tracking is not None:
                 tracking.finish()

@@ -123,6 +123,8 @@ def phase_tracking(config, phase, fresh=False, extra=None):
     write_json(path, states)
 
     def log(metrics, step=None):
+        if phase == "outer-rounds" and step is not None and step <= state["log_step"]:
+            return
         state["log_step"] = state["log_step"] + 1 if step is None else step
         tracking.log(metrics, step=state["log_step"])
         write_json(path, states)
@@ -391,7 +393,10 @@ def baseline_no_icl(config, task_id):
         print(f"Delta SR (ICL - No-ICL): {icl_result['success_rate'] - result['success_rate']}", flush=True)
 
 
-def evaluate(config, model_path, label, manifests):
+def evaluate(config, model_path, label, manifests, round_index=None, scope=None, excluded_game_files=None):
+    if round_index is not None:
+        from .interactive import evaluate_round
+        return evaluate_round(config, model_path, label, round_index, scope, manifests, excluded_game_files)
     import ray
     from omegaconf import OmegaConf
     from .runtime import RolloutRuntime, make_environment

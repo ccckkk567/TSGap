@@ -1,0 +1,118 @@
+paths:
+  root: /scratch/prjsnnn0000269/Students/shuming/cjk
+  repository: ${paths.root}/code/TSGap
+  models: ${paths.root}/models
+  data: ${paths.root}/data
+  outputs: ${paths.root}/outputs
+  logs: ${paths.root}/logs
+  checkpoint_root: /scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpoints
+
+run:
+  name: interactive_run01
+  output_dir: ${paths.outputs}/teaching/${run.name}
+  checkpoint_dir: ${paths.checkpoint_root}/${run.name}
+  generation_seed: 42
+
+logging:
+  backends: [console, swanlab]
+  project_name: alfworld-teaching
+  workspace: null
+  mode: online
+  log_dir: ${paths.logs}/${run.name}/swanlab
+  resume: allow
+
+tasks:
+  split: train
+  sample_seed: 42
+  data_root: ${paths.data}/alfworld
+
+bc:
+  tasks_per_type: 4
+  epochs: 2
+  learning_rate: 1.0e-5
+
+interactive:
+  groups: [chosen, teacher, guided]
+  rounds: 10
+  tasks_per_type_per_round: 2
+  active_tasks: 2
+
+teaching:
+  student_rollouts: 4
+  max_teacher_attempts: 3
+  review_steps: [10, 20, 30, 40]
+
+env:
+  env_name: alfworld/AlfredTWEnv
+  config_path: agent_system/environments/env_package/alfworld/configs/config_tw.yaml
+  seed: 0
+  history_length: 2
+  domain_randomization: false
+  max_steps: 50
+
+hardware:
+  gpu_type: H200
+  n_gpus: 1
+  login_nodes: [orion-login01, orion-login02]
+  ray_address: null
+
+teacher:
+  model_path: ${paths.models}/Qwen3-14B
+  n_gpus: ${hardware.n_gpus}
+  tensor_parallel_size: 1
+  prompt_length: 30720
+  gpu_memory_utilization: 0.5
+  chat_template_kwargs:
+    enable_thinking: true
+  review_chat_template_kwargs:
+    enable_thinking: false
+  action:
+    max_tokens: 1024
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+  review:
+    max_tokens: 256
+    temperature: 0.3
+    top_p: 0.9
+    top_k: 20
+
+student:
+  model_path: ${paths.models}/Qwen3-4B
+  n_gpus: ${hardware.n_gpus}
+  tensor_parallel_size: 1
+  prompt_length: 31744
+  gpu_memory_utilization: 0.5
+  chat_template_kwargs:
+    enable_thinking: true
+  action:
+    max_tokens: 1024
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+
+evaluation:
+  rounds: [0, 5, 10]
+  subset_per_type: 5
+  full_at_final: true
+  rollouts_per_task: 1
+  sampling:
+    max_tokens: 1024
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+
+sft:
+  initial_model_path: ${student.model_path}
+  n_gpus: ${hardware.n_gpus}
+  sequence_parallel_size: 1
+  train_batch_size: 4
+  micro_batch_size_per_gpu: 1
+  epochs: 1
+  learning_rate: 5.0e-6
+  max_length: null
+  use_remove_padding: false
+  enable_gradient_checkpointing: true
+  chat_template_kwargs:
+    enable_thinking: true
+  seed: 1

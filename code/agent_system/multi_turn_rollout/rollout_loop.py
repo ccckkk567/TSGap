@@ -75,7 +75,7 @@ class TrajectoryCollector:
 
         # Apply chat template
         prompt_with_chat_template = self.tokenizer.apply_chat_template(
-            chat,
+            obs["messages"][item] if "messages" in obs else chat,
             add_generation_prompt=True,
             tokenize=False,
             **self.chat_template_kwargs,
@@ -287,6 +287,17 @@ class TrajectoryCollector:
             success (Dict[str, np.ndarray]): Success samples for each environment
             traj_uid (np.ndarray): Trajectory unique identifiers
         """
+        steps = self.episode_steps(gen_batch, envs, reset_kwargs, episode_recorder)
+        try:
+            observation = next(steps)
+            while True:
+                observation = steps.send((actor_rollout_wg, observation))
+        except StopIteration as finished:
+            return finished.value
+
+    def episode_steps(self, gen_batch, envs, reset_kwargs=None, episode_recorder=None,
+                      record_only=False):
+        """Yield the next observation. Each send advances the existing environment once."""
         # Initial observations from the environment
         obs, infos = envs.reset(**(reset_kwargs or {}))
         if episode_recorder is not None:
@@ -319,6 +330,7 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
+            actor_rollout_wg, obs = yield obs
             active_masks = np.logical_not(is_done)
 
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
@@ -338,6 +350,7 @@ class TrajectoryCollector:
 
             batch_output = actor_rollout_wg.generate_sequences(batch_input)
 
+            del actor_rollout_wg
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
 
@@ -350,6 +363,12 @@ class TrajectoryCollector:
             next_obs, rewards, dones, infos = envs.step(text_actions)
             if episode_recorder is not None:
                 episode_recorder.after_step(next_obs, rewards, dones, infos)
+
+            if record_only:
+                if bool(dones[0]) or episode_recorder.record["steps"][-1]["won"]:
+                    return
+                obs = next_obs
+                continue
 
             batch.non_tensor_batch['full_output'] = text_actions
 
@@ -390,6 +409,9 @@ class TrajectoryCollector:
             # Break if all environments are done
             if is_done.all():
                 break
+
+        if record_only:
+            return
 
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,

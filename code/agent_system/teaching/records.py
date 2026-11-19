@@ -22,7 +22,9 @@ def read_jsonl(path):
 def write_jsonl(path, rows):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    temporary.replace(path)
 
 
 def completed_episode(path):
@@ -37,6 +39,7 @@ class EpisodeRecorder:
     def __init__(self, metadata):
         self.record = dict(metadata, status="running", success=None, steps=[], num_steps=0)
         self.pending = None
+        self.request_metadata = None
 
     def start(self, envs, observations, infos):
         self.record.update(
@@ -54,6 +57,9 @@ class EpisodeRecorder:
                 "admissible_actions": list(envs.envs.get_admissible_commands[0]),
                 "response": responses[0],
             }
+
+            if self.request_metadata is not None:
+                self.pending.update(self.request_metadata())
 
     def after_step(self, observations, rewards, dones, infos):
         if self.pending is None:

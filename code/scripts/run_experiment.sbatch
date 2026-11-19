@@ -15,7 +15,7 @@ set -eo pipefail
 ROOT=${ROOT:-/scratch/prjsnnn0000269/Students/shuming/cjk}
 CODE=${CODE:-$ROOT/code/TSGap/code}
 case "${1:-}" in
-    collect|train|evaluate)
+    interactive|collect|train|evaluate)
         if [[ "${TSGAP_GPU_JOB:-0}" != 1 ]]; then
             echo "Submit this stage with --gres=gpu:1 --export=ALL,TSGAP_GPU_JOB=1" >&2
             exit 1

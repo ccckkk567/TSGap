@@ -5,6 +5,85 @@ RLVMR provides agents with fine-grained meta-reasoning rewards, encouraging LLM 
 
 ![The RLVMR framework, comprising cold start and reinforcement learning phases, offers rule-verifiable feedback based on final outcomes and the comparative advantages of meta-reasoning behaviors. The RLVMR framework, comprising cold start and reinforcement learning phases, offers rule-verifiable feedback based on final outcomes and the comparative advantages of meta-reasoning behaviors. ](assets/RLVMR.png "The RLVMR framework, comprising cold start and reinforcement learning phases, offers rule-verifiable feedback based on final outcomes and the comparative advantages of meta-reasoning behaviors. The RLVMR framework, comprising cold start and reinforcement learning phases, offers rule-verifiable feedback based on final outcomes and the comparative advantages of meta-reasoning behaviors. ")
 
+## Interactive ALFWorld SFT on Orion
+
+The independent interactive experiment uses Qwen3-14B as the fixed Teacher and
+Qwen3-4B as the initial Student on one H200. Its configuration is
+`code/examples/teaching/interactive_config.yaml`. The high/low and cross-instance
+ICL commands below belong to the earlier teaching experiment.
+
+BC attempts 24 candidate tasks (four per type), retaining at most the first
+successful Teacher trajectory in three attempts per task. Two epochs produce
+the shared initial checkpoint. Ten rounds each use the same 12 new tasks across
+Chosen, Teacher and Guided. Chosen and Guided sample four Student episodes on
+each task, while Teacher uses the BC attempt rule. Guided reviews surviving
+sessions after actions 10/20/30/40. A diagnostic note is visible for the next
+action only. All branches train on successful episodes of at most 50 actions
+from the current round. Each example reconstructs the ordinary two-step prompt
+and preserves the actual response. A round with zero successes carries its
+input model forward. BC requires at least one success.
+
+On the login node, sync the code, then submit the following jobs. The wrapper
+is used directly from the checkout. Supply existing SwanLab credentials through
+the job environment. The jobs use the existing ALFWorld data and Python venv.
+
+```bash
+ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+git -C "$ROOT/code/TSGap" pull --ff-only
+CODE="$ROOT/code/TSGap/code"
+CONFIG="$CODE/examples/teaching/interactive_config.yaml"
+CHECKPOINT_ROOT=/scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpoints
+
+mkdir -p "$ROOT/logs" "$ROOT/outputs/teaching" "$CHECKPOINT_ROOT"
+
+bc_job=$(sbatch --parsable \
+  --job-name=tsgap-bc --time=06:00:00 \
+  --partition=testqueue --gres=gpu:1 \
+  --export=ALL,TSGAP_GPU_JOB=1 \
+  "$CODE/scripts/run_experiment.sbatch" \
+  interactive --stage bc --resume --config "$CONFIG")
+
+main_job_1=$(sbatch --parsable \
+  --job-name=tsgap-main --time=06:00:00 \
+  --partition=testqueue --gres=gpu:1 \
+  --export=ALL,TSGAP_GPU_JOB=1 \
+  --dependency="afterok:$bc_job" \
+  "$CODE/scripts/run_experiment.sbatch" \
+  interactive --stage main --resume --config "$CONFIG")
+
+main_job_2=$(sbatch --parsable \
+  --job-name=tsgap-main --time=06:00:00 \
+  --partition=testqueue --gres=gpu:1 \
+  --export=ALL,TSGAP_GPU_JOB=1 \
+  --dependency="afterany:$main_job_1" \
+  "$CODE/scripts/run_experiment.sbatch" \
+  interactive --stage main --resume --config "$CONFIG")
+```
+
+Submit further main jobs with the same arguments and an afterany dependency on
+the preceding main job. Run only one writer per experiment. Inspect the Slurm
+log for a failed job, since afterany also releases on errors. The run name and
+root configuration identify a single experiment. Logs use the Slurm job name
+and ID under `$ROOT/logs`.
+
+For the default run, manifests, trajectories, datasets, summaries and progress
+records are under `$ROOT/outputs/teaching/interactive_run01`. Working and
+published HF checkpoints are under `$CHECKPOINT_ROOT/interactive_run01`.
+A complete trainer summary permits publication to resume across a job timeout.
+After publication the round completion record is written before superseded
+models are removed. The shared BC, current branch models and models required
+for pending evaluation are retained. Completed episodes (including failures)
+and complete data exports are reused. Interrupted episodes restart at reset.
+An interrupted SFT restarts the current outer round from its input weights and
+rebuilds the optimizer and scheduler. Each round's auto length uses the longest
+exported example. Recorded cost excludes unpersisted computation at hard timeout.
+
+Evaluation uses the same unguided task lists and sampling across models, with
+one episode per task. BC and round five use fixed subsets. Round ten evaluates
+the full lists and derives its subset results from them. BC full evaluation
+reuses its matching subset episodes. Inspect `rounds/`, `eval/` and
+`final_comparison.json` for seen/unseen results, task-type breakdowns and gains.
+
 ## Environment setup on Orion
 
 The ALFWorld teaching experiment reuses `python/3.11.9` and the existing

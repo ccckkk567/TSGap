@@ -24,12 +24,13 @@ def load_config(path):
             elif old != "???" and old != new:
                 raise ValueError("A configured experiment setting changed. Use a new run.output_dir.")
     # Model-dependent fields can be filled after sampling/export, before use.
-    OmegaConf.save(config, saved)
+    temp = saved.with_suffix(".yaml.tmp")
+    OmegaConf.save(config, temp)
+    temp.replace(saved)
     return config
 
 
 def train(config, group):
-    from omegaconf import OmegaConf
     from agent_system.teaching.records import read_json
     directory = Path(config.run.output_dir) / "sft" / group
     if config.sft.n_gpus > config.hardware.n_gpus:
@@ -39,28 +40,44 @@ def train(config, group):
         raise ValueError("No paired trajectories available for SFT")
     if config.sft.max_length < max(s["max_length"] for s in summaries):
         raise ValueError("sft.max_length must accommodate both groups; see data_summary.json")
+    (directory / "training_summary.json").unlink(missing_ok=True)
+    launch_sft(config, directory, config.sft.initial_model_path, directory / "checkpoints",
+               group, None, config.sft.epochs, config.sft.learning_rate, config.sft.seed, 1)
+
+
+def launch_sft(config, directory, input_checkpoint, checkpoint_work_dir, group, round_index,
+               epochs, learning_rate, seed, training_attempt):
+    from omegaconf import OmegaConf
+    from agent_system.teaching.records import read_json
+    summary = read_json(directory / "data_summary.json")
+    max_length = config.sft.max_length if config.sft.max_length is not None else summary["max_length"]
+    if max_length < summary["max_length"]:
+        raise ValueError(f"sft.max_length too short for {directory}")
+    experiment_name = f"{config.run.name}-sft-{group}"
+    if round_index is not None:
+        experiment_name += f"-r{round_index:03d}-attempt{training_attempt}"
     base = Path(__file__).resolve().parents[1] / "verl/trainer/config/sft_trainer.yaml"
     training = OmegaConf.load(base)
     training.data.update(
         train_files=str(directory / "train.parquet"), val_files=None,
         prompt_key="extra_info", response_key="extra_info",
         prompt_dict_keys=["question"], response_dict_keys=["answer"],
-        max_length=config.sft.max_length, truncation="error", drop_last=False,
+        max_length=max_length, truncation="error", drop_last=False,
         train_batch_size=config.sft.train_batch_size,
         micro_batch_size_per_gpu=config.sft.micro_batch_size_per_gpu,
-        num_trajectories=summaries[0]["num_trajectories"],
+        num_trajectories=summary["num_trajectories"],
         chat_template_kwargs=dict(config.sft.get("chat_template_kwargs", {})),
     )
-    training.model.partial_pretrain = config.sft.initial_model_path
+    training.model.partial_pretrain = str(input_checkpoint)
     training.model.enable_gradient_checkpointing = config.sft.enable_gradient_checkpointing
-    training.optim.lr = config.sft.learning_rate
+    training.optim.lr = learning_rate
     training.ulysses_sequence_parallel_size = config.sft.sequence_parallel_size
     training.use_remove_padding = config.sft.use_remove_padding
     training.trainer.update(
-        total_epochs=config.sft.epochs, total_training_steps=None, seed=config.sft.seed,
-        default_local_dir=str(directory / "checkpoints"), default_hdfs_dir=None,
+        total_epochs=epochs, total_training_steps=None, seed=seed,
+        default_local_dir=str(checkpoint_work_dir), default_hdfs_dir=None,
         logger=list(config.logging.backends), project_name=config.logging.project_name,
-        experiment_name=f"{config.run.name}-sft-{group}",
+        experiment_name=experiment_name,
         summary_path=str(directory / "training_summary.json"),
         swanlab_kwargs=dict(workspace=config.logging.workspace, mode=config.logging.mode,
                            logdir=config.logging.log_dir),
@@ -69,17 +86,18 @@ def train(config, group):
     OmegaConf.resolve(training)
     path = directory / "trainer.yaml"
     OmegaConf.save(training, path)
-    (directory / "training_summary.json").unlink(missing_ok=True)
     command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
                f"--nproc_per_node={config.sft.n_gpus}", "-m", "verl.trainer.fsdp_sft_trainer",
                "--config-path", str(directory.resolve()), "--config-name", "trainer"]
-    subprocess.run(command, check=True)
+    subprocess.run(command + [f"hydra.run.dir={directory.resolve()}"], check=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["sample", "collect", "baseline", "select", "export-sft", "train", "evaluate", "summarize"])
-    parser.add_argument("--config", default="examples/teaching/config.yaml")
+    parser.add_argument("command", choices=["interactive", "sample", "collect", "baseline", "select", "export-sft", "train", "evaluate", "summarize"])
+    parser.add_argument("--stage", choices=["bc", "main"])
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--config")
     parser.add_argument("--run-dir")
     parser.add_argument("--task-id")
     parser.add_argument("--split", choices=["train", "valid_seen", "valid_unseen"])
@@ -93,13 +111,23 @@ def main():
     args = parser.parse_args()
     # Resolve source-relative paths consistently for shell and module entry points.
     os.chdir(Path(__file__).resolve().parents[1])
-    config_path = Path(args.run_dir) / "config.yaml" if args.run_dir else Path(args.config)
+    config_path = Path(args.run_dir) / "config.yaml" if args.run_dir else Path(args.config or (
+        "examples/teaching/interactive_config.yaml" if args.command == "interactive" else "examples/teaching/config.yaml"))
+    if args.command == "interactive" and not args.stage:
+        parser.error("interactive requires --stage bc or main")
+    if args.command == "interactive" and not args.resume:
+        from omegaconf import OmegaConf
+        if (Path(OmegaConf.load(config_path).run.output_dir) / "config.yaml").exists():
+            parser.error("Use --resume for an existing interactive run")
     config = load_config(config_path)
-    if args.command in ("collect", "baseline", "train", "evaluate"):
+    if args.command in ("interactive", "collect", "baseline", "train", "evaluate"):
         hostname = socket.gethostname().split(".")[0]
         if hostname in config.hardware.login_nodes:
             parser.error(f"GPU work must run on an allocated compute node, not {hostname}")
-    if args.command == "sample":
+    if args.command == "interactive":
+        from agent_system.teaching.interactive import run_interactive
+        run_interactive(config, args.stage, launch_sft)
+    elif args.command == "sample":
         from agent_system.teaching.tasks import sample_tasks, sample_student_targets
         split = args.split or config.tasks.split
         output = args.output or str(Path(config.run.output_dir) / ("manifest.jsonl" if split == "train" else f"manifest_{split}.jsonl"))
