@@ -23,48 +23,84 @@ from the current round. Each example reconstructs the ordinary two-step prompt
 and preserves the actual response. A round with zero successes carries its
 input model forward. BC requires at least one success.
 
-On the login node, sync the code, then submit the following jobs. The wrapper
-is used directly from the checkout. Supply existing SwanLab credentials through
-the job environment. The jobs use the existing ALFWorld data and Python venv.
+BC prepares the shared configuration, manifests, prompt and initial checkpoint.
+For a BC already running on Orion, leave its checkout in place until the job
+finishes successfully. Cancel only the pending serial Main jobs from the old
+submission using their individual job IDs. BC may launch its SFT subprocess
+later in the allocation.
+
+For a fresh run, submit BC once from the login node:
 
 ```bash
 ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
-git -C "$ROOT/code/TSGap" pull --ff-only
 CODE="$ROOT/code/TSGap/code"
-CONFIG="$CODE/examples/teaching/interactive_config.yaml"
 CHECKPOINT_ROOT=/scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpoints
-
 mkdir -p "$ROOT/logs" "$ROOT/outputs/teaching" "$CHECKPOINT_ROOT"
-
-bc_job=$(sbatch --parsable \
-  --job-name=tsgap-bc --time=08:00:00 \
-  --partition=testqueue --gres=gpu:1 \
-  --export=ALL,TSGAP_GPU_JOB=1 \
-  "$CODE/scripts/run_experiment.sbatch" \
-  interactive --stage bc --resume --config "$CONFIG")
-
-main_job_1=$(sbatch --parsable \
-  --job-name=tsgap-main --time=06:00:00 \
-  --partition=testqueue --gres=gpu:1 \
-  --export=ALL,TSGAP_GPU_JOB=1 \
-  --dependency="afterok:$bc_job" \
-  "$CODE/scripts/run_experiment.sbatch" \
-  interactive --stage main --resume --config "$CONFIG")
-
-main_job_2=$(sbatch --parsable \
-  --job-name=tsgap-main --time=06:00:00 \
-  --partition=testqueue --gres=gpu:1 \
-  --export=ALL,TSGAP_GPU_JOB=1 \
-  --dependency="afterany:$main_job_1" \
-  "$CODE/scripts/run_experiment.sbatch" \
-  interactive --stage main --resume --config "$CONFIG")
+sbatch --parsable --partition=testqueue --gres=gpu:1 --time=08:00:00 \
+  --job-name=tsgap-bc --export=ALL,TSGAP_GPU_JOB=1 \
+  "$CODE/scripts/run_experiment.sbatch" interactive --stage bc --resume \
+  --config "$CODE/examples/teaching/interactive_config.yaml"
 ```
 
-Submit further main jobs with the same arguments and an afterany dependency on
-the preceding main job. Run only one writer per experiment. Inspect the Slurm
-log for a failed job, since afterany also releases on errors. The run name and
-root configuration identify a single experiment. Logs use the Slurm job name
-and ID under `$ROOT/logs`.
+Once BC succeeds, sync and submit the following block once. Each branch starts
+from the checkpoint named in `sft/bc/train_complete.json`. Each allocation
+requests one GPU. The second allocation waits for its own first job to end.
+
+```bash
+(
+  set -e
+  ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+  REPO="$ROOT/code/TSGap"
+  CODE="$REPO/code"
+  CONFIG="$CODE/examples/teaching/interactive_config.yaml"
+  JOB="$CODE/scripts/run_experiment.sbatch"
+  test -s "$ROOT/outputs/teaching/interactive_run01/sft/bc/train_complete.json"
+  git -C "$REPO" pull --ff-only
+  cd "$CODE"
+  opts=(--parsable --partition=testqueue --gres=gpu:1 --time=06:00:00
+        --export=ALL,TSGAP_GPU_JOB=1)
+  for group in chosen teacher guided; do
+    args=(interactive --stage main --group "$group" --resume --config "$CONFIG")
+    first=$(sbatch "${opts[@]}" --job-name="tsgap-$group-1" "$JOB" "${args[@]}")
+    echo "$group first job: $first"
+    tail_job=$(sbatch "${opts[@]}" --job-name="tsgap-$group-2" \
+      --dependency="afterany:${first%%;*}" "$JOB" "${args[@]}")
+    echo "$group chain tail: $tail_job"
+  done
+)
+```
+
+Keep one active chain per group. The two six-hour allocations are an initial
+budget. Inspect the Slurm log under `$ROOT/logs` after a failure. To extend
+Guided while its tail is queued or running, use that tail's numeric job ID:
+
+```bash
+CODE=/scratch/prjsnnn0000269/Students/shuming/cjk/code/TSGap/code
+read -rp 'Guided chain tail job ID: ' tail_id
+sbatch --parsable --partition=testqueue --gres=gpu:1 --time=06:00:00 \
+  --export=ALL,TSGAP_GPU_JOB=1 --job-name=tsgap-guided-resume \
+  --dependency="afterany:$tail_id" "$CODE/scripts/run_experiment.sbatch" \
+  interactive --stage main --group guided --resume \
+  --config "$CODE/examples/teaching/interactive_config.yaml"
+```
+
+If the chain has already ended and still needs work, omit the dependency.
+The branches log their round metrics under `rounds/{group}/` and own their
+respective `tracking_state/{group}.json`. Chosen also evaluates BC before its
+first round and after its final round. Once the BC and three branch final
+evaluations have completed on both splits, submit the CPU comparison:
+
+```bash
+CODE=/scratch/prjsnnn0000269/Students/shuming/cjk/code/TSGap/code
+sbatch --parsable --partition=ioqueue --cpus-per-task=1 --mem=4G \
+  --time=00:15:00 --export=ALL,TSGAP_GPU_JOB=0 --job-name=tsgap-summary \
+  "$CODE/scripts/run_experiment.sbatch" interactive-summary \
+  --config "$CODE/examples/teaching/interactive_config.yaml"
+```
+
+The summary verifies the completion records, model paths and evaluation
+settings before writing `final_comparison.json`. Missing inputs are reported
+by group and round.
 
 For the default run, manifests, trajectories, datasets, summaries and progress
 records are under `$ROOT/outputs/teaching/interactive_run01`. Working and

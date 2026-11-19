@@ -7,12 +7,13 @@ import sys
 import socket
 
 
-def load_config(path):
+def load_config(path, *, read_only=False):
     from omegaconf import OmegaConf
     config = OmegaConf.load(path)
     root = Path(config.run.output_dir)
-    root.mkdir(parents=True, exist_ok=True)
     saved = root / "config.yaml"
+    if read_only and not saved.is_file():
+        raise FileNotFoundError(f"Missing configuration from BC: {saved}")
     if saved.exists():
         previous = OmegaConf.to_container(OmegaConf.load(saved), resolve=False)
         current = OmegaConf.to_container(config, resolve=False)
@@ -23,6 +24,9 @@ def load_config(path):
                 pending.extend((old[key], new[key]) for key in old)
             elif old != "???" and old != new:
                 raise ValueError("A configured experiment setting changed. Use a new run.output_dir.")
+    if read_only:
+        return config
+    root.mkdir(parents=True, exist_ok=True)
     # Model-dependent fields can be filled after sampling/export, before use.
     temp = saved.with_suffix(".yaml.tmp")
     OmegaConf.save(config, temp)
@@ -94,7 +98,8 @@ def launch_sft(config, directory, input_checkpoint, checkpoint_work_dir, group, 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["interactive", "sample", "collect", "baseline", "select", "export-sft", "train", "evaluate", "summarize"])
+    parser.add_argument("command", choices=["interactive", "interactive-summary", "sample", "collect", "baseline",
+                                           "select", "export-sft", "train", "evaluate", "summarize"])
     parser.add_argument("--stage", choices=["bc", "main"])
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--config")
@@ -107,26 +112,37 @@ def main():
     parser.add_argument("--manifest", action="append")
     parser.add_argument("--model-path")
     parser.add_argument("--label", choices=["initial", "high", "low"])
-    parser.add_argument("--group", choices=["high", "low"])
+    parser.add_argument("--group", choices=["high", "low", "chosen", "teacher", "guided"])
     args = parser.parse_args()
     # Resolve source-relative paths consistently for shell and module entry points.
     os.chdir(Path(__file__).resolve().parents[1])
     config_path = Path(args.run_dir) / "config.yaml" if args.run_dir else Path(args.config or (
-        "examples/teaching/interactive_config.yaml" if args.command == "interactive" else "examples/teaching/config.yaml"))
+        "examples/teaching/interactive_config.yaml" if args.command in ("interactive", "interactive-summary")
+        else "examples/teaching/config.yaml"))
+    branch_main = args.command == "interactive" and args.stage == "main"
+    if branch_main and args.group not in ("chosen", "teacher", "guided"):
+        parser.error("interactive --stage main requires --group chosen, teacher or guided")
+    if args.command == "interactive" and args.stage == "bc" and args.group is not None:
+        parser.error("--group applies only to the main stage of interactive")
+    if args.command == "train" and args.group not in ("high", "low"):
+        parser.error("train requires --group high or low")
     if args.command == "interactive" and not args.stage:
         parser.error("interactive requires --stage bc or main")
     if args.command == "interactive" and not args.resume:
         from omegaconf import OmegaConf
         if (Path(OmegaConf.load(config_path).run.output_dir) / "config.yaml").exists():
             parser.error("Use --resume for an existing interactive run")
-    config = load_config(config_path)
+    config = load_config(config_path, read_only=branch_main or args.command == "interactive-summary")
     if args.command in ("interactive", "collect", "baseline", "train", "evaluate"):
         hostname = socket.gethostname().split(".")[0]
         if hostname in config.hardware.login_nodes:
             parser.error(f"GPU work must run on an allocated compute node, not {hostname}")
     if args.command == "interactive":
         from agent_system.teaching.interactive import run_interactive
-        run_interactive(config, args.stage, launch_sft)
+        run_interactive(config, args.stage, launch_sft, group=args.group)
+    elif args.command == "interactive-summary":
+        from agent_system.teaching.interactive import summarize_interactive
+        summarize_interactive(config)
     elif args.command == "sample":
         from agent_system.teaching.tasks import sample_tasks, sample_student_targets
         split = args.split or config.tasks.split
@@ -146,8 +162,6 @@ def main():
         else:
             export_sft(config.run.output_dir)
     elif args.command == "train":
-        if args.group is None:
-            parser.error("train requires --group high or low")
         train(config, args.group)
     else:
         from agent_system.teaching.experiment import collect, baseline_no_icl, evaluate, summarize

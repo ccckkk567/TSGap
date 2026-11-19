@@ -111,7 +111,7 @@ def review_examples(episodes):
     return examples
 
 
-def collect_round(config, group, number, tasks, input_checkpoint):
+def collect_round(config, group, number, tasks, input_checkpoint, *, tracking_namespace=None):
     import json
     from agent_system.environments.prompts.teacher_review import SYSTEM
     directory = Path(config.run.output_dir) / "collect" / round_path(group, number)
@@ -134,7 +134,10 @@ def collect_round(config, group, number, tasks, input_checkpoint):
             write_json(progress, counts)
         return counts
 
-    with phase_tracking(config, f"collect-{group}-r{number:03d}") as log, rollout_models(config) as models:
+    with (
+        phase_tracking(config, f"collect-{group}-r{number:03d}", tracking_namespace=tracking_namespace) as log,
+        rollout_models(config) as models,
+    ):
         for offset in range(0, len(tasks), width):
             try:
                 paths = collect_batch(config, models, group, number, tasks[offset:offset + width], directory,
@@ -183,7 +186,7 @@ def recover_training_result(directory, work, final, group, number, source):
     return marker
 
 
-def train_round(config, group, number, tasks, source, train_fn):
+def train_round(config, group, number, tasks, source, train_fn, *, tracking_namespace=None):
     part = round_path(group, number)
     directory = Path(config.run.output_dir) / "sft" / part
     checkpoints = Path(config.run.checkpoint_dir)
@@ -196,7 +199,7 @@ def train_round(config, group, number, tasks, source, train_fn):
     summary_file = directory / "data_summary.json"
     summary = read_json(summary_file) if summary_file.exists() else {}
     if summary.get("status") != "complete" or (summary["num_turns"] and not (directory / "train.parquet").exists()):
-        selected = collect_round(config, group, number, tasks, source)
+        selected = collect_round(config, group, number, tasks, source, tracking_namespace=tracking_namespace)
         summary = export_episode_sft(config, selected, directory)
     if not summary["num_turns"]:
         if group == "bc":
@@ -229,7 +232,7 @@ def train_round(config, group, number, tasks, source, train_fn):
     return marker
 
 
-def evaluate_round(config, model, group, number, scope, manifests, excluded):
+def evaluate_round(config, model, group, number, scope, manifests, excluded, *, tracking_namespace=None):
     root = Path(config.run.output_dir) / "eval" / group / f"round_{number:03d}"
     other = "subset" if scope == "full" else "full"
     totals = {}
@@ -257,7 +260,8 @@ def evaluate_round(config, model, group, number, scope, manifests, excluded):
                 continue
             write_json(saved, settings)
             if log is None:
-                log = stack.enter_context(phase_tracking(config, f"eval-{group}-r{number:03d}-{scope}"))
+                log = stack.enter_context(phase_tracking(config, f"eval-{group}-r{number:03d}-{scope}",
+                                                         tracking_namespace=tracking_namespace))
             episodes = []
             reused = fresh_in = fresh_out = 0
             other_dir = root / other / split
@@ -334,9 +338,9 @@ def cleanup(config, group, records):
             shutil.rmtree(work)
         if group != "bc" and n in config.evaluation.rounds:
             scope = "full" if n == config.interactive.rounds and config.evaluation.full_at_final else "subset"
-            if any(not (output / "eval" / part / scope / split / "summary.json").exists()
-                   for split in ("valid_seen", "valid_unseen")):
-                require_model(marker["output_checkpoint"])
+            summaries = (output / "eval" / part / scope / split / "summary.json"
+                         for split in ("valid_seen", "valid_unseen"))
+            if any(not path.is_file() or read_json(path).get("status") != "complete" for path in summaries):
                 keep.add(Path(marker["output_checkpoint"]))
     for marker in records:
         final = checkpoint_root / round_path(group, marker["round_index"])
@@ -374,98 +378,126 @@ def round_metrics(output, records):
     return metrics
 
 
-def record_bc_metrics(config, output, marker, results):
+def record_bc_metrics(config, output, marker, results, *, tracking_namespace=None):
     path = output / "rounds" / "round_000.json"
     if not path.exists():
         metrics = round_metrics(output, {"bc": [marker]})
         metrics.update(curve_metrics("bc", results))
-        with phase_tracking(config, "outer-rounds") as log:
+        with phase_tracking(config, "outer-rounds-bc", tracking_namespace=tracking_namespace) as log:
             log(metrics, step=0)
         write_json(path, metrics)
 
 
-def run_interactive(config, stage, train_fn):
+def run_interactive(config, stage, train_fn, *, group=None):
     from agent_system.environments.prompts.teacher_review import SYSTEM
     output = Path(config.run.output_dir)
     bc = read_marker(output, "bc", 0)
-    if stage == "main" and bc is None:
-        raise RuntimeError("Main requires the published shared BC checkpoint and completion record.")
-    if bc:
-        require_model(bc["output_checkpoint"])
-        cleanup(config, "bc", [bc])
-        if stage == "bc":
+    system_path = output / "prompts" / "teacher_review_system.txt"
+    if stage == "bc":
+        if bc:
+            require_model(bc["output_checkpoint"])
+            cleanup(config, "bc", [bc])
             print("BC already complete.")
             return
-    manifests = prepare_interactive_manifests(config)
-    system_path = output / "prompts" / "teacher_review_system.txt"
-    system_path.parent.mkdir(parents=True, exist_ok=True)
-    if not system_path.exists() or system_path.read_text(encoding="utf-8") != SYSTEM:
-        temporary = system_path.with_suffix(".tmp")
-        temporary.write_text(SYSTEM, encoding="utf-8")
-        temporary.replace(system_path)
-    if stage == "bc":
+        manifests = prepare_interactive_manifests(config)
+        system_path.parent.mkdir(parents=True, exist_ok=True)
+        if not system_path.exists() or system_path.read_text(encoding="utf-8") != SYSTEM:
+            temporary = system_path.with_suffix(".tmp")
+            temporary.write_text(SYSTEM, encoding="utf-8")
+            temporary.replace(system_path)
         bc = train_round(config, "bc", 0, manifests["bc"], config.sft.initial_model_path, train_fn)
         cleanup(config, "bc", [bc])
         return
 
-    groups = list(config.interactive.groups)
-    if groups != ["chosen", "teacher", "guided"]:
+    if stage != "main" or group not in ("chosen", "teacher", "guided"):
+        raise ValueError("Main requires a chosen, teacher or guided group")
+    if list(config.interactive.groups) != ["chosen", "teacher", "guided"]:
         raise ValueError("Interactive groups must be chosen, teacher, guided in protocol order")
-    histories = {g: [] for g in groups}
-    for group in groups:
-        for n in range(1, config.interactive.rounds + 1):
-            marker = read_marker(output, group, n)
-            if not marker:
-                continue
-            if n != len(histories[group]) + 1:
+    if bc is None:
+        raise RuntimeError("Main requires the published shared BC checkpoint and completion record.")
+    require_model(bc["output_checkpoint"])
+    manifests = prepare_interactive_manifests(config, allow_create=False)
+    if system_path.read_text(encoding="utf-8") != SYSTEM:
+        raise ValueError(f"Teacher review prompt differs from the saved BC input: {system_path}")
+    total = config.interactive.rounds
+    history = []
+    for n in range(1, total + 1):
+        marker = read_marker(output, group, n)
+        if marker:
+            if n != len(history) + 1:
                 raise ValueError(f"Noncontiguous completed rounds for {group}")
-            histories[group].append(marker)
-        if histories[group]:
-            require_model(histories[group][-1]["output_checkpoint"])
-            cleanup(config, group, histories[group])
-    if (output / "final_comparison.json").exists():
-        print("Interactive experiment already complete.")
-        return
+            history.append(marker)
+    if history:
+        require_model(history[-1]["output_checkpoint"])
+        cleanup(config, group, history)
     excluded = {r["game_file"] for name in ("bc", "train") for r in manifests[name]}
 
-    def assess(group, number, model, scope):
+    def assess(label, number, model, scope):
         paths = [output / "manifests" / f"eval_{split}_{scope}.jsonl" for split in ("valid_seen", "valid_unseen")]
-        return evaluate(config, model, group, paths, round_index=number, scope=scope, excluded_game_files=excluded)
+        return evaluate(config, model, label, paths, round_index=number, scope=scope,
+                        excluded_game_files=excluded, tracking_namespace=group)
 
-    baseline_subset = assess("bc", 0, bc["output_checkpoint"], "subset") if 0 in config.evaluation.rounds else {}
-    record_bc_metrics(config, output, bc, baseline_subset)
-    total = config.interactive.rounds
-    comparison = {}
+    if group == "chosen":
+        baseline_subset = assess("bc", 0, bc["output_checkpoint"], "subset") if 0 in config.evaluation.rounds else {}
+        record_bc_metrics(config, output, bc, baseline_subset, tracking_namespace=group)
+
     for n in range(1, total + 1):
+        if len(history) < n:
+            tasks = [t for t in manifests["train"] if t["round_index"] == n]
+            source = history[-1]["output_checkpoint"] if history else bc["output_checkpoint"]
+            history.append(train_round(config, group, n, tasks, source, train_fn, tracking_namespace=group))
+            cleanup(config, group, history)
+        model = history[n - 1]["output_checkpoint"]
         curve = {}
-        tasks = [t for t in manifests["train"] if t["round_index"] == n]
-        for group in groups:
-            history = histories[group]
-            if len(history) < n:
-                source = history[-1]["output_checkpoint"] if history else bc["output_checkpoint"]
-                history.append(train_round(config, group, n, tasks, source, train_fn))
-                cleanup(config, group, history)
-            model = history[n - 1]["output_checkpoint"]
-            if n in config.evaluation.rounds:
-                if n == total and config.evaluation.full_at_final:
-                    comparison[group] = assess(group, n, model, "full")
-                subset = assess(group, n, model, "subset")
-                curve.update(curve_metrics(group, subset))
-                if n == total and not config.evaluation.full_at_final:
-                    comparison[group] = subset
-        summary_path = output / "rounds" / f"round_{n:03d}.json"
+        if n in config.evaluation.rounds:
+            if n == total and config.evaluation.full_at_final:
+                assess(group, n, model, "full")
+            curve = curve_metrics(group, assess(group, n, model, "subset"))
+        summary_path = output / "rounds" / group / f"round_{n:03d}.json"
         if not summary_path.exists():
-            metrics = round_metrics(output, {g: records[:n] for g, records in histories.items()})
+            metrics = round_metrics(output, {group: history[:n]})
             metrics.update(curve)
-            with phase_tracking(config, "outer-rounds") as log:
+            with phase_tracking(config, f"outer-rounds-{group}", tracking_namespace=group) as log:
                 log(metrics, step=n)
             write_json(summary_path, metrics)
+
+    if group == "chosen":
+        final_scope = "full" if config.evaluation.full_at_final else "subset"
+        assess("bc", 0, bc["output_checkpoint"], final_scope)
+    cleanup(config, group, history)
+
+
+def summarize_interactive(config):
+    output = Path(config.run.output_dir)
     scope = "full" if config.evaluation.full_at_final else "subset"
-    comparison["bc"] = assess("bc", 0, bc["output_checkpoint"], scope)
+    comparison = {}
+    problems = []
+    for group in ("bc", "chosen", "teacher", "guided"):
+        number = 0 if group == "bc" else config.interactive.rounds
+        marker = read_marker(output, group, number)
+        if marker is None:
+            problems.append(f"Missing training completion record: {group} round {number}")
+        comparison[group] = {}
+        for split in ("valid_seen", "valid_unseen"):
+            path = output / "eval" / group / f"round_{number:03d}" / scope / split / "summary.json"
+            report = read_json(path) if path.is_file() else {}
+            if report.get("status") != "complete":
+                problems.append(f"Missing or incomplete evaluation: {path}")
+            elif marker and report.get("settings", {}).get("model_path") != marker["output_checkpoint"]:
+                problems.append(f"Evaluation checkpoint differs from training completion record: {path}")
+            else:
+                comparison[group][split] = report
+    if problems:
+        raise ValueError("\n".join(problems))
     result = {split: compare_evaluations({g: r[split] for g, r in comparison.items()})
               for split in ("valid_seen", "valid_unseen")}
-    with phase_tracking(config, "final-comparison") as log:
+    path = output / "final_comparison.json"
+    final = dict(scope=scope, splits=result)
+    if path.exists() and read_json(path) == final:
+        print(f"Interactive comparison already complete: {path}")
+        return
+    with phase_tracking(config, "final-comparison", tracking_namespace="summary") as log:
         log({f"{scope}/{split}/{kind}/{k}": v for split, report in result.items()
              for kind, stats in {"overall": report["overall"], **report["by_type"]}.items()
              for k,v in (stats["scores"] | stats["differences"]).items()})
-    write_json(output / "final_comparison.json", dict(scope=scope, splits=result))
+    write_json(path, final)

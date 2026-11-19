@@ -31,10 +31,14 @@ if [[ -f "$CREDENTIALS" ]]; then
     source "$CREDENTIALS"
 fi
 
-if [[ "${1:-}" == "interactive" && -z "${SWANLAB_API_KEY:-}" ]]; then
-    echo "ERROR: SWANLAB_API_KEY is unavailable. Check the private credentials file." >&2
-    exit 1
-fi
+case "${1:-}" in
+    interactive|interactive-summary)
+        if [[ -z "${SWANLAB_API_KEY:-}" ]]; then
+            echo "ERROR: SWANLAB_API_KEY is unavailable. Check the private credentials file." >&2
+            exit 1
+        fi
+        ;;
+esac
 
 cd "$CODE"
 python -m scripts.teaching_experiment "$@"

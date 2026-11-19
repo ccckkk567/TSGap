@@ -98,10 +98,12 @@ def analyze_student_episode(runtime, episode, directory, seed, config):
 
 
 @contextmanager
-def phase_tracking(config, phase, fresh=False, extra=None):
+def phase_tracking(config, phase, fresh=False, extra=None, *, tracking_namespace=None):
     from omegaconf import OmegaConf
     from verl.utils.tracking import Tracking
-    path = Path(config.run.output_dir) / "tracking_state.json"
+    root = Path(config.run.output_dir)
+    path = (root / "tracking_state.json" if tracking_namespace is None
+            else root / "tracking_state" / f"{tracking_namespace}.json")
     states = read_json(path) if path.exists() else {}
     if fresh:
         index = 1
@@ -123,7 +125,7 @@ def phase_tracking(config, phase, fresh=False, extra=None):
     write_json(path, states)
 
     def log(metrics, step=None):
-        if phase == "outer-rounds" and step is not None and step <= state["log_step"]:
+        if (phase == "outer-rounds" or phase.startswith("outer-rounds-")) and step is not None and step <= state["log_step"]:
             return
         state["log_step"] = state["log_step"] + 1 if step is None else step
         tracking.log(metrics, step=state["log_step"])
@@ -393,10 +395,12 @@ def baseline_no_icl(config, task_id):
         print(f"Delta SR (ICL - No-ICL): {icl_result['success_rate'] - result['success_rate']}", flush=True)
 
 
-def evaluate(config, model_path, label, manifests, round_index=None, scope=None, excluded_game_files=None):
+def evaluate(config, model_path, label, manifests, round_index=None, scope=None, excluded_game_files=None,
+             *, tracking_namespace=None):
     if round_index is not None:
         from .interactive import evaluate_round
-        return evaluate_round(config, model_path, label, round_index, scope, manifests, excluded_game_files)
+        return evaluate_round(config, model_path, label, round_index, scope, manifests, excluded_game_files,
+                              tracking_namespace=tracking_namespace)
     import ray
     from omegaconf import OmegaConf
     from .runtime import RolloutRuntime, make_environment

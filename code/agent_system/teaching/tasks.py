@@ -92,7 +92,7 @@ def interactive_seed(config, phase, index, slot=0):
     return config.run.generation_seed + ((phase * 10000 + index) * 8 + slot) * 64
 
 
-def prepare_interactive_manifests(config):
+def prepare_interactive_manifests(config, *, allow_create=True):
     directory = Path(config.run.output_dir) / "manifests"
     manifests = {}
     excluded = set()
@@ -103,6 +103,8 @@ def prepare_interactive_manifests(config):
         if target.exists():
             rows = read_jsonl(target)
         else:
+            if not allow_create:
+                raise FileNotFoundError(f"Missing manifest from BC: {target}")
             rng = random.Random(config.tasks.sample_seed + seed_offset)
             rows = []
             if full is None and split not in pools:
@@ -136,7 +138,7 @@ def prepare_interactive_manifests(config):
                     raise ValueError(f"Incorrect type quota in round {n}")
         if full is not None and any(r not in full for r in rows):
             raise ValueError(f"{name} does not match its full manifest")
-        if not target.exists():
+        if allow_create and not target.exists():
             write_jsonl(target, rows)
         manifests[name] = rows
         return files
