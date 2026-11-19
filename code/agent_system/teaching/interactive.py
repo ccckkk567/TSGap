@@ -18,10 +18,13 @@ def round_path(group, number):
 
 @contextmanager
 def rollout_models(config):
+    import os
     import ray
     options = dict(address=config.hardware.ray_address, runtime_env={"env_vars": {"VLLM_USE_V1": "0"}})
     if options["address"] is None:
         options["num_gpus"] = config.hardware.n_gpus
+        job_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+        options["_temp_dir"] = f"/tmp/tsgap-ray-{job_id}"
     ray.init(**options)
     models = SequentialRollouts(config)
     try:
