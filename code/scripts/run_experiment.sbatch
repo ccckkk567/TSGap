@@ -23,5 +23,18 @@ case "${1:-}" in
         ;;
 esac
 source "$CODE/scripts/common.sh"
+
+# Load existing private credentials on the compute node.
+CREDENTIALS="$ROOT/dep-prep-credentials.env"
+
+if [[ -f "$CREDENTIALS" ]]; then
+    source "$CREDENTIALS"
+fi
+
+if [[ "${1:-}" == "interactive" && -z "${SWANLAB_API_KEY:-}" ]]; then
+    echo "ERROR: SWANLAB_API_KEY is unavailable. Check the private credentials file." >&2
+    exit 1
+fi
+
 cd "$CODE"
 python -m scripts.teaching_experiment "$@"
