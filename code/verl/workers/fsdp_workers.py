@@ -138,6 +138,25 @@ class ActorRolloutRefWorker(Worker):
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
+    def _load_model_metadata(self, local_path, override_model_config, trust_remote_code):
+        from transformers import AutoConfig
+        from verl.utils.model import get_generation_config, update_model_config
+
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        overrides = {
+            'bos_token_id': self.tokenizer.bos_token_id,
+            'eos_token_id': self.tokenizer.eos_token_id,
+            'pad_token_id': self.tokenizer.pad_token_id,
+        }
+        overrides.update(override_model_config)
+        update_model_config(model_config, override_config_kwargs=overrides)
+        if self.rank == 0:
+            print(f'Model config after override: {model_config}')
+        return model_config
+
     def _build_model_optimizer(self,
                                model_path,
                                fsdp_config,
@@ -148,9 +167,9 @@ class ActorRolloutRefWorker(Worker):
                                trust_remote_code=False,
                                use_liger=False,
                                role='actor'):
-        from verl.utils.model import print_model_size, update_model_config, get_generation_config
+        from verl.utils.model import print_model_size
         from verl.utils.torch_dtypes import PrecisionType
-        from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForVision2Seq
+        from transformers import AutoModelForCausalLM, AutoModelForVision2Seq
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
         from torch import optim
 
@@ -158,32 +177,15 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
         local_path = copy_to_local(model_path)
+        actor_model_config = self._load_model_metadata(local_path, override_model_config, trust_remote_code)
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
-
         torch_dtype = fsdp_config.get('model_dtype', None)
         if torch_dtype is None:
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
-
-        # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-
-        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
-
-        override_config_kwargs = {
-            'bos_token_id': self.tokenizer.bos_token_id,
-            'eos_token_id': self.tokenizer.eos_token_id,
-            'pad_token_id': self.tokenizer.pad_token_id,
-        }
-        override_config_kwargs.update(override_model_config)
-        update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
-        if self.rank == 0:
-            print(f'Model config after override: {actor_model_config}')
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings,
@@ -386,7 +388,12 @@ class ActorRolloutRefWorker(Worker):
 
         use_remove_padding = self.config.model.get('use_remove_padding', False)
 
-        if self._is_actor or self._is_rollout:
+        if self.static_rollout:
+            # The SPMD engine loads weights directly from the checkpoint.
+            self.actor_model_config = self._load_model_metadata(
+                copy_to_local(self.config.model.path), override_model_config,
+                self.config.model.get('trust_remote_code', False))
+        elif self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
             if self._is_actor:
                 optim_config = self.config.actor.optim

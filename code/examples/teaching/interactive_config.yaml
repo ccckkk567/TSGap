@@ -8,7 +8,7 @@ paths:
   checkpoint_root: /scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpoints
 
 run:
-  name: interactive_run01
+  name: interactive_run02_teacher32b
   output_dir: ${paths.outputs}/teaching/${run.name}
   checkpoint_dir: ${paths.checkpoint_root}/${run.name}
   generation_seed: 42
@@ -36,6 +36,7 @@ interactive:
   rounds: 10
   tasks_per_type_per_round: 2
   active_tasks: 2
+  static_rollout: true
 
 teaching:
   student_rollouts: 4
@@ -57,11 +58,11 @@ hardware:
   ray_address: null
 
 teacher:
-  model_path: ${paths.models}/Qwen3-14B
+  model_path: ${paths.models}/Qwen3-32B
   n_gpus: ${hardware.n_gpus}
   tensor_parallel_size: 1
   prompt_length: 30720
-  gpu_memory_utilization: 0.5
+  gpu_memory_utilization: 0.8
   chat_template_kwargs:
     enable_thinking: true
   review_chat_template_kwargs:

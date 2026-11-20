@@ -7,7 +7,7 @@ RLVMR provides agents with fine-grained meta-reasoning rewards, encouraging LLM 
 
 ## Interactive ALFWorld SFT on Orion
 
-The independent interactive experiment uses Qwen3-14B as the fixed Teacher and
+The independent interactive experiment uses Qwen3-32B as the fixed Teacher and
 Qwen3-4B as the initial Student on one H200. Its configuration is
 `code/examples/teaching/interactive_config.yaml`. The high/low and cross-instance
 ICL commands below belong to the earlier teaching experiment.
@@ -23,122 +23,27 @@ from the current round. Each example reconstructs the ordinary two-step prompt
 and preserves the actual response. A round with zero successes carries its
 input model forward. BC requires at least one success.
 
-BC prepares the shared configuration, manifests, prompt and initial checkpoint.
-For a BC already running on Orion, leave its checkout in place until the job
-finishes successfully. Cancel only the pending serial Main jobs from the old
-submission using their individual job IDs. BC may launch its SFT subprocess
-later in the allocation.
+### Launch the new 32B experiment
 
-For a fresh run, submit BC once from the login node:
+The default configuration creates `interactive_run02_teacher32b`. Its manifests,
+episodes, exported data, markers and evaluations live under
+`$ROOT/outputs/teaching/interactive_run02_teacher32b`. Its SwanLab state and logs
+use the new run, and model checkpoints live under
+`/scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpoints/interactive_run02_teacher32b`.
+The original 4B Student learns from freshly collected 32B demonstrations.
+The 14B run `interactive_run01` experienced a native crash during BC collection.
+Its configuration and recovery notes are archived at [d37f87f](https://github.com/ccckkk567/TSGap/tree/d37f87f).
 
-```bash
-ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
-CODE="$ROOT/code/TSGap/code"
-CHECKPOINT_ROOT=/scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpoints
-mkdir -p "$ROOT/logs" "$ROOT/outputs/teaching" "$CHECKPOINT_ROOT"
-sbatch --parsable --partition=testqueue --gres=gpu:1 --time=08:00:00 \
-  --job-name=tsgap-bc --export=ALL,TSGAP_GPU_JOB=1 \
-  "$CODE/scripts/run_experiment.sbatch" interactive --stage bc --resume \
-  --config "$CODE/examples/teaching/interactive_config.yaml"
-```
+`interactive.static_rollout: true` selects single-GPU vLLM SPMD. The worker loads
+HF metadata and the checkpoint's own tokenizer; vLLM owns the model weights.
+Each request keeps its sampling seed and resets the prefix cache on success.
+Changing the role or checkpoint rebuilds the worker. Teacher GPU utilization
+starts at 0.8, Student at 0.5. Actual KV-cache capacity, peak memory and stability
+with the 32B Teacher require the first H200 run.
 
-Once BC succeeds, sync and submit the following block once. Each branch starts
-from the checkpoint named in `sft/bc/train_complete.json`. Each allocation
-requests one GPU. The second allocation waits for its own first job to end.
-
-```bash
-(
-  set -e
-  ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
-  REPO="$ROOT/code/TSGap"
-  CODE="$REPO/code"
-  CONFIG="$CODE/examples/teaching/interactive_config.yaml"
-  JOB="$CODE/scripts/run_experiment.sbatch"
-  test -s "$ROOT/outputs/teaching/interactive_run01/sft/bc/train_complete.json"
-  git -C "$REPO" pull --ff-only
-  cd "$CODE"
-  opts=(--parsable --partition=testqueue --gres=gpu:1 --time=06:00:00
-        --export=ALL,TSGAP_GPU_JOB=1)
-  for group in chosen teacher guided; do
-    args=(interactive --stage main --group "$group" --resume --config "$CONFIG")
-    first=$(sbatch "${opts[@]}" --job-name="tsgap-$group-1" "$JOB" "${args[@]}")
-    echo "$group first job: $first"
-    tail_job=$(sbatch "${opts[@]}" --job-name="tsgap-$group-2" \
-      --dependency="afterany:${first%%;*}" "$JOB" "${args[@]}")
-    echo "$group chain tail: $tail_job"
-  done
-)
-```
-
-Keep one active chain per group. The two six-hour allocations are an initial
-budget. Inspect the Slurm log under `$ROOT/logs` after a failure. To extend
-Guided while its tail is queued or running, use that tail's numeric job ID:
-
-```bash
-CODE=/scratch/prjsnnn0000269/Students/shuming/cjk/code/TSGap/code
-read -rp 'Guided chain tail job ID: ' tail_id
-sbatch --parsable --partition=testqueue --gres=gpu:1 --time=06:00:00 \
-  --export=ALL,TSGAP_GPU_JOB=1 --job-name=tsgap-guided-resume \
-  --dependency="afterany:$tail_id" "$CODE/scripts/run_experiment.sbatch" \
-  interactive --stage main --group guided --resume \
-  --config "$CODE/examples/teaching/interactive_config.yaml"
-```
-
-If the chain has already ended and still needs work, omit the dependency.
-The branches log their round metrics under `rounds/{group}/` and own their
-respective `tracking_state/{group}.json`. Chosen also evaluates BC before its
-first round and after its final round. Once the BC and three branch final
-evaluations have completed on both splits, submit the CPU comparison:
-
-```bash
-CODE=/scratch/prjsnnn0000269/Students/shuming/cjk/code/TSGap/code
-sbatch --parsable --partition=ioqueue --cpus-per-task=1 --mem=4G \
-  --time=00:15:00 --export=ALL,TSGAP_GPU_JOB=0 --job-name=tsgap-summary \
-  "$CODE/scripts/run_experiment.sbatch" interactive-summary \
-  --config "$CODE/examples/teaching/interactive_config.yaml"
-```
-
-The summary verifies the completion records, model paths and evaluation
-settings before writing `final_comparison.json`. Missing inputs are reported
-by group and round.
-
-For the default run, manifests, trajectories, datasets, summaries and progress
-records are under `$ROOT/outputs/teaching/interactive_run01`. Working and
-published HF checkpoints are under `$CHECKPOINT_ROOT/interactive_run01`.
-A complete trainer summary permits publication to resume across a job timeout.
-After publication the round completion record is written before superseded
-models are removed. The shared BC, current branch models and models required
-for pending evaluation are retained. Completed episodes (including failures)
-and complete data exports are reused. Interrupted episodes restart at reset.
-An interrupted SFT restarts the current outer round from its input weights and
-rebuilds the optimizer and scheduler. Each round's auto length uses the longest
-exported example. Recorded cost excludes unpersisted computation at hard timeout.
-
-Evaluation uses the same unguided task lists and sampling across models, with
-one episode per task. BC and round five use fixed subsets. Round ten evaluates
-the full lists and derives its subset results from them. BC full evaluation
-reuses its matching subset episodes. Inspect `rounds/`, `eval/` and
-`final_comparison.json` for seen/unseen results, task-type breakdowns and gains.
-
-### Resume after the vLLM crash in BC job 213818
-
-Interactive collection and evaluation use static rollout on one GPU (TP 1).
-Each vLLM worker loads its actual checkpoint once. A change of role or checkpoint
-rebuilds the worker. This avoids the repeated FSDP weight transfer and vLLM
-sleep allocator path seen before the native `none_dealloc` crash. Each completed
-generation resets the prefix cache. Account for this runtime change when
-comparing collection times across the restart.
-
-Use the existing venv, YAML and `interactive_run01` records. Completed successes
-and failures count toward the same attempt budget. An interrupted episode
-restarts at the same task and slot. Development verification covered Python
-syntax, the Git diff and the static generation path. The resumed GPU job is
-the first runtime check: look for the Teacher checkpoint and `static_rollout=True`
-at worker initialization, followed by newly completed episodes.
-
-Check the old allocation and dependencies on the login node. Before changing
-the checkout, inspect the command and working directory of any running job
-that may use it, including the two ALFWorld jobs if still active.
+**Inspect the historical queue on the login node.** Confirm the state of BC
+213818, the identities of the old pending jobs, and the command and working
+directory of jobs using the checkout. Inspect 211432 and 211429 if still active.
 
 ```bash
 sacct -j 213818 -o JobID,JobName%22,State,ExitCode,Elapsed,Timelimit
@@ -147,9 +52,8 @@ scontrol show job 211432
 scontrol show job 211429
 ```
 
-After confirming the old BC failed and the IDs below still belong to its
-pending chain, cancel the tails first, then the first segments and the sync.
-Rebuilding the chain starts new queue waits.
+Only if these IDs still identify the obsolete pending chain, cancel its tails
+first, then its first segments, then its sync job. Leave unrelated jobs running.
 
 ```bash
 scancel --state=PENDING 213973 213974 213975
@@ -158,39 +62,169 @@ scancel --state=PENDING 213968
 squeue -u "$USER"
 ```
 
-Once the old chain is cleared and the checkout is idle, pull the fix and
-submit this block once. Each first segment waits for the new BC to succeed.
-Each tail waits for its own first segment to end. If submission stops midway,
-use the printed IDs to submit only the missing segments.
+**Set up the submission shell.** Run the following in Bash. Repeat this setup
+when using a new login session. All `sbatch` commands below run on the login node.
+
+```bash
+export ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+REPO="$ROOT/code/TSGap"
+export CODE="$REPO/code" TSGAP_GPU_JOB=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+CONFIG="$CODE/examples/teaching/interactive_config.yaml"
+JOB="$CODE/scripts/run_experiment.sbatch"
+RUN=interactive_run02_teacher32b
+OUT="$ROOT/outputs/teaching/$RUN"
+CKPT="/scratch/prjsnnn0000269/Students/shuming/storage_ext/cjk/checkpoints/$RUN"
+export MARKER="$OUT/sft/bc/train_complete.json" BC_MODEL="$CKPT/bc"
+PYTHON="$ROOT/envs/alfworld/bin/python"
+opts=(--parsable --account=prjsnnn0000269 --partition=testqueue --gres=gpu:1 --export=ALL)
+```
+
+**Start BC once, after the checkout is idle.** This checks the local Teacher
+tokenizer, config and indexed safetensors shards without loading the model.
+Stop and provision the model separately if a check fails. Resolve any existing
+run artifacts before starting; retained episodes count toward the attempt budget
+only when resuming this same 32B experiment.
 
 ```bash
 (
   set -euo pipefail
-  export ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
-  REPO="$ROOT/code/TSGap"
-  export CODE="$REPO/code" TSGAP_GPU_JOB=1
-  JOB="$CODE/scripts/run_experiment.sbatch"
-  CONFIG="$CODE/examples/teaching/interactive_config.yaml"
   git -C "$REPO" pull --ff-only
-  git -C "$REPO" log -1 --oneline
+  "$PYTHON" - "$CONFIG" "$ROOT/models/Qwen3-32B" "$OUT" "$CKPT" <<'PY'
+import json, sys
+from pathlib import Path
+from omegaconf import OmegaConf
+from safetensors import safe_open
+from transformers import AutoTokenizer
+
+config_file, model, out, checkpoints = map(Path, sys.argv[1:])
+cfg = OmegaConf.load(config_file)
+if (Path(cfg.teacher.model_path) != model or not cfg.interactive.static_rollout
+        or Path(cfg.run.output_dir) != out or Path(cfg.run.checkpoint_dir) != checkpoints):
+    sys.exit("Unexpected Interactive configuration or run paths")
+for directory in (out, checkpoints, Path(cfg.logging.log_dir).parent):
+    if directory.exists() and any(directory.iterdir()):
+        sys.exit(f"Inspect the existing run directory before starting: {directory}")
+for name in ("config.json", "tokenizer_config.json", "model.safetensors.index.json"):
+    if not (model / name).is_file():
+        sys.exit(f"Missing {model / name}")
+metadata = json.loads((model / "config.json").read_text())
+if metadata.get("model_type") != "qwen3":
+    sys.exit("Unexpected Teacher architecture")
+weights = json.loads((model / "model.safetensors.index.json").read_text())["weight_map"]
+if not weights:
+    sys.exit("Empty Teacher weight index")
+for shard in set(weights.values()):
+    with safe_open(str(model / shard), framework="np") as f:
+        if not {key for key, name in weights.items() if name == shard}.issubset(f.keys()):
+            sys.exit(f"Incomplete Teacher shard: {shard}")
+tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+messages = [{"role": "user", "content": "Hello"}]
+prompts = [tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                         enable_thinking=flag) for flag in (True, False)]
+if prompts[0] == prompts[1]:
+    sys.exit("Check the 32B tokenizer's thinking template")
+print(f"Verified local Teacher metadata and {len(set(weights.values()))} indexed shards")
+PY
   mkdir -p "$ROOT/logs"
-  cd "$CODE"
-  opts=(--parsable --account=prjsnnn0000269 --partition=testqueue --gres=gpu:1 --export=ALL)
-  bc=$(sbatch "${opts[@]}" --time=08:00:00 --job-name=tsgap-bc-resume \
-    "$JOB" interactive --stage bc --resume --config "$CONFIG")
-  bc=${bc%%;*}
-  echo "BC resume: $bc"
+  sbatch "${opts[@]}" --time=08:00:00 --job-name=tsgap-32b-bc1 \
+    "$JOB" interactive --stage bc --config "$CONFIG"
+)
+```
+
+Watch the BC log for `checkpoint=.../Qwen3-32B, static_rollout=True`, vLLM shard
+loading, and new `collect/bc/*/attempt_*.json` files. On OOM, inspect the vLLM
+profiling and KV capacity at the configured context length. If BC ended before
+publishing its checkpoint, resolve the reported failure or timeout and submit
+one continuation. Completed successes and failures are reused; an interrupted
+episode restarts from its task and slot.
+
+```bash
+sbatch "${opts[@]}" --time=08:00:00 --job-name=tsgap-32b-bc-resume \
+  "$JOB" interactive --stage bc --resume --config "$CONFIG"
+```
+
+**Submit Main after BC publishes its checkpoint.** Define these two functions
+in the submission shell. They are shared by both submission options below.
+
+```bash
+check_bc() {
+  "$ROOT/envs/alfworld/bin/python" - <<'PY'
+import json, os
+from pathlib import Path
+marker = json.loads(Path(os.environ["MARKER"]).read_text())
+model = Path(marker["output_checkpoint"])
+if ((marker["status"], marker["group"], marker["round_index"]) != ("complete", "bc", 0)
+        or model.resolve() != Path(os.environ["BC_MODEL"]).resolve() or not model.is_dir()):
+    raise SystemExit("New 32B BC completion record or checkpoint is invalid")
+print(f"Verified shared BC checkpoint: {model}")
+PY
+}
+
+submit_branches() (
+  set -euo pipefail
   for group in chosen teacher guided; do
     args=(interactive --stage main --group "$group" --resume --config "$CONFIG")
-    first=$(sbatch "${opts[@]}" --time=06:00:00 --job-name="tsgap-$group-1" \
-      --dependency="afterok:$bc" "$JOB" "${args[@]}")
-    first=${first%%;*}
+    first=$(sbatch "${opts[@]}" --time=06:00:00 --job-name="tsgap-32b-$group-1" \
+      "$@" "$JOB" "${args[@]}")
     echo "$group first: $first"
-    tail_job=$(sbatch "${opts[@]}" --time=06:00:00 --job-name="tsgap-$group-2" \
-      --dependency="afterany:$first" "$JOB" "${args[@]}")
-    echo "$group tail: ${tail_job%%;*}"
+    tail_job=$(sbatch "${opts[@]}" --time=06:00:00 --job-name="tsgap-32b-$group-2" \
+      --dependency="afterany:${first%%;*}" "$JOB" "${args[@]}")
+    echo "$group tail: $tail_job"
   done
 )
+```
+
+After BC ends successfully, run once:
+
+```bash
+check_bc && submit_branches
+```
+
+The three first segments run independently. Each tail resumes only its branch.
+If submission stops midway, use the printed IDs to submit the missing segments.
+To extend one active chain, depend on its current tail, for example:
+
+```bash
+read -rp 'Guided tail job ID: ' tail_id
+sbatch "${opts[@]}" --time=06:00:00 --job-name=tsgap-32b-guided-resume \
+  --dependency="afterany:$tail_id" "$JOB" interactive --stage main --group guided \
+  --resume --config "$CONFIG"
+```
+
+**Optional advance queueing.** Use this instead of the `check_bc && submit_branches`
+submission above. After submitting the first BC, run the following once while
+its tail is queued or running. This example budgets one additional eight-hour
+BC segment. Slurm then runs a CPU-only marker check. If BC is still incomplete,
+the check fails and the Main dependency chain must be rebuilt after more BC time.
+
+```bash
+(
+  set -euo pipefail
+  read -rp 'Current BC chain tail job ID: ' previous
+  tail_bc=$(sbatch "${opts[@]}" --time=08:00:00 --job-name=tsgap-32b-bc-resume \
+    --dependency="afterany:$previous" "$JOB" interactive --stage bc --resume --config "$CONFIG")
+  echo "BC tail: $tail_bc"
+  gate=$({
+    echo '#!/bin/bash'
+    declare -f check_bc
+    echo 'check_bc'
+  } | sbatch --parsable --account=prjsnnn0000269 --partition=ioqueue \
+      --cpus-per-task=1 --mem=2G --time=00:10:00 --export=ALL \
+      --job-name=tsgap-32b-check-bc --output="$ROOT/logs/%x-%j.out" \
+      --dependency="afterany:${tail_bc%%;*}")
+  echo "CPU check: $gate"
+  submit_branches --dependency="afterok:${gate%%;*}"
+)
+```
+
+Chosen owns BC subset/full evaluation. Branches evaluate their own rounds 5
+and 10. After all four final evaluations are complete on both splits, submit
+the CPU comparison from the same shell:
+
+```bash
+TSGAP_GPU_JOB=0 sbatch --parsable --account=prjsnnn0000269 --partition=ioqueue \
+  --cpus-per-task=1 --mem=4G --time=00:15:00 --export=ALL --job-name=tsgap-32b-summary \
+  "$JOB" interactive-summary --config "$CONFIG"
 ```
 
 ## Environment setup on Orion

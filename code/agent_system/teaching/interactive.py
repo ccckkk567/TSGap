@@ -26,7 +26,7 @@ def rollout_models(config):
         job_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
         options["_temp_dir"] = f"/tmp/tsgap-ray-{job_id}"
     ray.init(**options)
-    models = SequentialRollouts(config, static_rollout=True)
+    models = SequentialRollouts(config, static_rollout=bool(config.interactive.get("static_rollout", False)))
     try:
         yield models
     finally:
