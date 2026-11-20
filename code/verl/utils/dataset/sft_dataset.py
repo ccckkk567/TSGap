@@ -78,8 +78,8 @@ class SFTDataset(Dataset):
 
         def series_to_item(ls):
             import pandas, numpy
-            while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
-                ls = ls[0]
+            while isinstance(ls, (pandas.Series, numpy.ndarray)) and len(ls) == 1:
+                ls = ls.iloc[0] if isinstance(ls, pandas.Series) else ls[0]
             return ls
 
         dataframes = []
