@@ -34,6 +34,68 @@ def load_config(path, *, read_only=False):
     return config
 
 
+def check_orion_run(path, mode):
+    """Read-only preflight shared by the standalone Orion submission and job entries."""
+    import json
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(path)
+    root = Path("/scratch/prjsnnn0000269/Students/shuming/cjk")
+    name = "interactive_run02_teacher32b"
+    output = root / "outputs/teaching" / name
+    checkpoints = root.parent / "storage_ext/cjk/checkpoints" / name
+    teacher, student = (root / "models" / model for model in ("Qwen3-32B", "Qwen3-4B"))
+    if (cfg.run.name != name or Path(cfg.run.output_dir) != output
+            or Path(cfg.run.checkpoint_dir) != checkpoints or Path(cfg.logging.log_dir) != root / "logs" / name / "swanlab"
+            or Path(cfg.teacher.model_path) != teacher or Path(cfg.student.model_path) != student
+            or Path(cfg.sft.initial_model_path) != student or cfg.interactive.static_rollout is not True):
+        raise ValueError("Unexpected Orion run, model, output paths or static rollout configuration")
+    saved = output / "config.yaml"
+    if mode == "fresh":
+        if saved.exists():
+            raise ValueError(f"{saved} exists. Check active jobs and use --bc-resume for this run.")
+        for directory in (output, checkpoints, Path(cfg.logging.log_dir).parent):
+            if directory.exists() and any(directory.iterdir()):
+                raise ValueError(f"Inspect the existing run artifacts before starting: {directory}")
+    elif mode in ("resume", "main"):
+        load_config(path, read_only=True)
+    else:
+        raise ValueError(f"Unknown preflight mode: {mode}")
+    if mode == "main":
+        from agent_system.teaching.interactive import require_bc_ready
+        require_bc_ready(cfg)
+        return
+
+    from safetensors import safe_open
+    from transformers import AutoTokenizer
+
+    for model in (teacher, student):
+        if json.loads((model / "config.json").read_text())["model_type"] != "qwen3":
+            raise ValueError(f"Unexpected architecture: {model}")
+        index = model / "model.safetensors.index.json"
+        if index.exists():
+            shards = {}
+            for key, filename in json.loads(index.read_text())["weight_map"].items():
+                shards.setdefault(filename, set()).add(key)
+        else:
+            shards = {"model.safetensors": set()}
+        if not shards:
+            raise ValueError(f"Empty weight index: {index}")
+        for filename, expected in shards.items():
+            with safe_open(str(model / filename), framework="np") as shard:
+                keys = set(shard.keys())
+                if not keys or not expected <= keys:
+                    raise ValueError(f"Incomplete weights: {model / filename}")
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        if model != teacher:
+            continue
+        prompts = [tokenizer.apply_chat_template([{"role": "user", "content": "Hello"}], tokenize=False,
+                                                 add_generation_prompt=True, enable_thinking=flag)
+                   for flag in (True, False)]
+        if prompts[0] == prompts[1]:
+            raise ValueError(f"Check the Qwen3 thinking template: {model}")
+
+
 def train(config, group):
     from agent_system.teaching.records import read_json
     directory = Path(config.run.output_dir) / "sft" / group

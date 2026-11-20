@@ -232,6 +232,33 @@ def train_round(config, group, number, tasks, source, train_fn, *, tracking_name
     return marker
 
 
+EVAL_SPLITS = ("valid_seen", "valid_unseen")
+
+
+def evaluation_settings(config, model, split, tasks):
+    return dict(tasks=tasks, sampling=dict(config.evaluation.sampling),
+                seed_rule="base + ((phase*10000 + eval_index)*8 + slot)*64 + action_index",
+                phase={"valid_seen": 4, "valid_unseen": 5}[split], base_seed=config.run.generation_seed,
+                env_seed=config.env.seed, history_length=config.env.history_length, max_steps=config.env.max_steps,
+                rollouts_per_task=config.evaluation.rollouts_per_task, model_path=str(model),
+                demonstration="", teacher_guidance="")
+
+
+def check_eval_summary(report, settings, path):
+    tasks = settings["tasks"]
+    budget = settings["rollouts_per_task"]
+    kinds = {task["task_type"] for task in tasks}
+    if (report["status"] != "complete" or report["settings"] != settings
+            or report["count"] != len(tasks) * budget or set(report["by_type"]) != kinds):
+        raise ValueError(f"Incomplete evaluation or mismatched settings: {path}")
+    for kind, stats in report["by_type"].items():
+        if stats["count"] != sum(t["task_type"] == kind for t in tasks) * budget:
+            raise ValueError(f"Wrong evaluation count for {kind}: {path}")
+    if any(key not in stats for stats in (report, *report["by_type"].values())
+           for key in ("success_rate", "mean_steps")):
+        raise ValueError(f"Missing evaluation metrics: {path}")
+
+
 def evaluate_round(config, model, group, number, scope, manifests, excluded, *, tracking_namespace=None):
     root = Path(config.run.output_dir) / "eval" / group / f"round_{number:03d}"
     other = "subset" if scope == "full" else "full"
@@ -242,22 +269,21 @@ def evaluate_round(config, model, group, number, scope, manifests, excluded, *, 
             tasks = read_jsonl(manifest)
             split = tasks[0]["split"]
             directory = root / scope / split
-            phase = {"valid_seen": 4, "valid_unseen": 5}[split]
-            settings = dict(tasks=tasks, sampling=dict(config.evaluation.sampling),
-                            seed_rule="base + ((phase*10000 + eval_index)*8 + slot)*64 + action_index",
-                            phase=phase, base_seed=config.run.generation_seed, env_seed=config.env.seed,
-                            history_length=config.env.history_length, max_steps=config.env.max_steps,
-                            rollouts_per_task=config.evaluation.rollouts_per_task, model_path=str(model),
-                            demonstration="", teacher_guidance="")
+            settings = evaluation_settings(config, model, split, tasks)
+            phase = settings["phase"]
             if any(t["game_file"] in excluded for t in tasks):
                 raise ValueError(f"Evaluation overlaps training: {manifest}")
             saved = directory / "settings.json"
             if saved.exists() and read_json(saved) != settings:
                 raise ValueError(f"Evaluation settings changed: {saved}")
             summary = directory / "summary.json"
-            if summary.exists() and read_json(summary).get("status") == "complete":
-                totals[split] = read_json(summary)
+            report = read_json(summary) if summary.exists() else {}
+            if report.get("status") == "complete":
+                check_eval_summary(report, settings, summary)
+                totals[split] = report
                 continue
+            if not saved.exists() and any(directory.glob("*/episode_*.json")):
+                raise ValueError(f"Cannot verify existing episodes without {saved}")
             write_json(saved, settings)
             if log is None:
                 log = stack.enter_context(phase_tracking(config, f"eval-{group}-r{number:03d}-{scope}",
@@ -274,13 +300,18 @@ def evaluate_round(config, model, group, number, scope, manifests, excluded, *, 
                     relative = Path(task["task_id"]) / f"episode_{slot}.json"
                     path = directory / relative
                     ep = completed_episode(path)
+                    episode_source = path
                     if ep is None and compatible and alt_tasks.get(task["task_id"]) == task:
                         source = other_dir / relative
                         ep = completed_episode(source)
                         if ep is not None:
-                            if ep["generation_settings"]["seed"] != interactive_seed(config, phase, task["eval_index"], slot):
-                                raise ValueError(f"Unexpected evaluation seed in {source}")
-                            ep = dict(ep, reused_from=str(source))
+                            episode_source = source
+                    if ep is not None:
+                        if (any(ep.get(k) != v for k, v in task.items()) or ep.get("model_path") != str(model)
+                                or ep["generation_settings"]["seed"] != interactive_seed(config, phase, task["eval_index"], slot)):
+                            raise ValueError(f"Unexpected evaluation episode identity, checkpoint or seed: {episode_source}")
+                        if episode_source != path:
+                            ep = dict(ep, reused_from=str(episode_source))
                             write_json(path, ep)
                     if ep is None:
                         if runtime is None:
@@ -388,37 +419,82 @@ def record_bc_metrics(config, output, marker, results, *, tracking_namespace=Non
         write_json(path, metrics)
 
 
+def bc_model(config, marker):
+    if not marker:
+        raise ValueError("Missing BC training completion record")
+    path = marker["output_checkpoint"]
+    if Path(path) != Path(config.run.checkpoint_dir) / "bc":
+        raise ValueError(f"Unexpected BC checkpoint: {path}")
+    require_model(path)
+    return path
+
+
+def require_bc_ready(config):
+    """Validate the shared baseline without modifying artifacts or loading weights."""
+    output = Path(config.run.output_dir)
+    try:
+        bc = read_marker(output, "bc", 0)
+        model = bc_model(config, bc)
+        manifests = prepare_interactive_manifests(config, allow_create=False)
+        subset = {}
+        for scope in ("full", "subset"):
+            for split in EVAL_SPLITS:
+                tasks = manifests[f"eval_{split}_{scope}"]
+                path = output / "eval/bc/round_000" / scope / split / "summary.json"
+                report = read_json(path)
+                check_eval_summary(report, evaluation_settings(config, model, split, tasks), path)
+                if scope == "subset":
+                    subset[split] = report
+        metrics = read_json(output / "rounds/round_000.json")
+        expected = curve_metrics("bc", subset)
+        if ("bc/train/optimizer_steps" not in metrics
+                or any(metrics.get(k) != v for k, v in expected.items())):
+            raise ValueError("BC round 0 metrics differ from the evaluated baseline")
+        return bc, manifests
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError(f"BC training or baseline evaluation incomplete; resume BC first: {error}") from error
+
+
 def run_interactive(config, stage, train_fn, *, group=None):
     from agent_system.environments.prompts.teacher_review import SYSTEM
     output = Path(config.run.output_dir)
-    bc = read_marker(output, "bc", 0)
     system_path = output / "prompts" / "teacher_review_system.txt"
-    if stage == "bc":
-        if bc:
-            require_model(bc["output_checkpoint"])
-            cleanup(config, "bc", [bc])
-            print("BC already complete.")
-            return
-        manifests = prepare_interactive_manifests(config)
+    is_bc = stage == "bc"
+    if is_bc:
+        bc = read_marker(output, "bc", 0)
+        manifests = prepare_interactive_manifests(config, allow_create=bc is None)
         system_path.parent.mkdir(parents=True, exist_ok=True)
-        if not system_path.exists() or system_path.read_text(encoding="utf-8") != SYSTEM:
+        if not system_path.exists():
             temporary = system_path.with_suffix(".tmp")
             temporary.write_text(SYSTEM, encoding="utf-8")
             temporary.replace(system_path)
-        bc = train_round(config, "bc", 0, manifests["bc"], config.sft.initial_model_path, train_fn)
-        cleanup(config, "bc", [bc])
-        return
-
-    if stage != "main" or group not in ("chosen", "teacher", "guided"):
-        raise ValueError("Main requires a chosen, teacher or guided group")
-    if list(config.interactive.groups) != ["chosen", "teacher", "guided"]:
-        raise ValueError("Interactive groups must be chosen, teacher, guided in protocol order")
-    if bc is None:
-        raise RuntimeError("Main requires the published shared BC checkpoint and completion record.")
-    require_model(bc["output_checkpoint"])
-    manifests = prepare_interactive_manifests(config, allow_create=False)
+    else:
+        if stage != "main" or group not in ("chosen", "teacher", "guided"):
+            raise ValueError("Main requires a chosen, teacher or guided group")
+        if list(config.interactive.groups) != ["chosen", "teacher", "guided"]:
+            raise ValueError("Interactive groups must be chosen, teacher, guided in protocol order")
+        bc, manifests = require_bc_ready(config)
     if system_path.read_text(encoding="utf-8") != SYSTEM:
         raise ValueError(f"Teacher review prompt differs from the saved BC input: {system_path}")
+    excluded = {r["game_file"] for name in ("bc", "train") for r in manifests[name]}
+
+    def assess(label, number, model, scope):
+        paths = [output / "manifests" / f"eval_{split}_{scope}.jsonl" for split in EVAL_SPLITS]
+        return evaluate(config, model, label, paths, round_index=number, scope=scope,
+                        excluded_game_files=excluded, tracking_namespace=label)
+
+    if is_bc:
+        if bc is None:
+            bc = train_round(config, "bc", 0, manifests["bc"], config.sft.initial_model_path, train_fn,
+                             tracking_namespace="bc")
+        model = bc_model(config, bc)
+        cleanup(config, "bc", [bc])
+        assess("bc", 0, model, "full")
+        subset = assess("bc", 0, model, "subset")
+        record_bc_metrics(config, output, bc, subset, tracking_namespace="bc")
+        require_bc_ready(config)
+        return
+
     total = config.interactive.rounds
     history = []
     for n in range(1, total + 1):
@@ -430,17 +506,6 @@ def run_interactive(config, stage, train_fn, *, group=None):
     if history:
         require_model(history[-1]["output_checkpoint"])
         cleanup(config, group, history)
-    excluded = {r["game_file"] for name in ("bc", "train") for r in manifests[name]}
-
-    def assess(label, number, model, scope):
-        paths = [output / "manifests" / f"eval_{split}_{scope}.jsonl" for split in ("valid_seen", "valid_unseen")]
-        return evaluate(config, model, label, paths, round_index=number, scope=scope,
-                        excluded_game_files=excluded, tracking_namespace=group)
-
-    if group == "chosen":
-        baseline_subset = assess("bc", 0, bc["output_checkpoint"], "subset") if 0 in config.evaluation.rounds else {}
-        record_bc_metrics(config, output, bc, baseline_subset, tracking_namespace=group)
-
     for n in range(1, total + 1):
         if len(history) < n:
             tasks = [t for t in manifests["train"] if t["round_index"] == n]
@@ -461,9 +526,6 @@ def run_interactive(config, stage, train_fn, *, group=None):
                 log(metrics, step=n)
             write_json(summary_path, metrics)
 
-    if group == "chosen":
-        final_scope = "full" if config.evaluation.full_at_final else "subset"
-        assess("bc", 0, bc["output_checkpoint"], final_scope)
     cleanup(config, group, history)
 
 
