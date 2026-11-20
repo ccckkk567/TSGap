@@ -106,10 +106,12 @@ class vLLMRollout(BaseRollout):
                              please increase max_num_batched_tokens or disable chunked prefill')
 
         trust_remote_code = kwargs.get('trust_remote_code', False)
+        self.static_rollout = bool(config.get("static_rollout", False))
+        engine_kwargs = {"load_format": "auto"} if self.static_rollout else {}
 
         self.inference_engine = LLM(
             model=model_path,
-            enable_sleep_mode=True,
+            enable_sleep_mode=not self.static_rollout,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
             seed=int(config.get("seed", 42)),
@@ -125,10 +127,12 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
+            **engine_kwargs,
         )
 
         # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        if not self.static_rollout:
+            self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,
@@ -295,5 +299,8 @@ class vLLMRollout(BaseRollout):
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
+
+        if self.static_rollout:
+            self.inference_engine.reset_prefix_cache()
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)

@@ -120,6 +120,79 @@ the full lists and derives its subset results from them. BC full evaluation
 reuses its matching subset episodes. Inspect `rounds/`, `eval/` and
 `final_comparison.json` for seen/unseen results, task-type breakdowns and gains.
 
+### Resume after the vLLM crash in BC job 213818
+
+Interactive collection and evaluation use static rollout on one GPU (TP 1).
+Each vLLM worker loads its actual checkpoint once. A change of role or checkpoint
+rebuilds the worker. This avoids the repeated FSDP weight transfer and vLLM
+sleep allocator path seen before the native `none_dealloc` crash. Each completed
+generation resets the prefix cache. Account for this runtime change when
+comparing collection times across the restart.
+
+Use the existing venv, YAML and `interactive_run01` records. Completed successes
+and failures count toward the same attempt budget. An interrupted episode
+restarts at the same task and slot. Development verification covered Python
+syntax, the Git diff and the static generation path. The resumed GPU job is
+the first runtime check: look for the Teacher checkpoint and `static_rollout=True`
+at worker initialization, followed by newly completed episodes.
+
+Check the old allocation and dependencies on the login node. Before changing
+the checkout, inspect the command and working directory of any running job
+that may use it, including the two ALFWorld jobs if still active.
+
+```bash
+sacct -j 213818 -o JobID,JobName%22,State,ExitCode,Elapsed,Timelimit
+squeue -u "$USER" -o "%.18i %.22j %.10T %.40E %R"
+scontrol show job 211432
+scontrol show job 211429
+```
+
+After confirming the old BC failed and the IDs below still belong to its
+pending chain, cancel the tails first, then the first segments and the sync.
+Rebuilding the chain starts new queue waits.
+
+```bash
+scancel --state=PENDING 213973 213974 213975
+scancel --state=PENDING 213969 213970 213971
+scancel --state=PENDING 213968
+squeue -u "$USER"
+```
+
+Once the old chain is cleared and the checkout is idle, pull the fix and
+submit this block once. Each first segment waits for the new BC to succeed.
+Each tail waits for its own first segment to end. If submission stops midway,
+use the printed IDs to submit only the missing segments.
+
+```bash
+(
+  set -euo pipefail
+  export ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+  REPO="$ROOT/code/TSGap"
+  export CODE="$REPO/code" TSGAP_GPU_JOB=1
+  JOB="$CODE/scripts/run_experiment.sbatch"
+  CONFIG="$CODE/examples/teaching/interactive_config.yaml"
+  git -C "$REPO" pull --ff-only
+  git -C "$REPO" log -1 --oneline
+  mkdir -p "$ROOT/logs"
+  cd "$CODE"
+  opts=(--parsable --account=prjsnnn0000269 --partition=testqueue --gres=gpu:1 --export=ALL)
+  bc=$(sbatch "${opts[@]}" --time=08:00:00 --job-name=tsgap-bc-resume \
+    "$JOB" interactive --stage bc --resume --config "$CONFIG")
+  bc=${bc%%;*}
+  echo "BC resume: $bc"
+  for group in chosen teacher guided; do
+    args=(interactive --stage main --group "$group" --resume --config "$CONFIG")
+    first=$(sbatch "${opts[@]}" --time=06:00:00 --job-name="tsgap-$group-1" \
+      --dependency="afterok:$bc" "$JOB" "${args[@]}")
+    first=${first%%;*}
+    echo "$group first: $first"
+    tail_job=$(sbatch "${opts[@]}" --time=06:00:00 --job-name="tsgap-$group-2" \
+      --dependency="afterany:$first" "$JOB" "${args[@]}")
+    echo "$group tail: ${tail_job%%;*}"
+  done
+)
+```
+
 ## Environment setup on Orion
 
 The ALFWorld teaching experiment reuses `python/3.11.9` and the existing

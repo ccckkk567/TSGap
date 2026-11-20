@@ -9,8 +9,9 @@ _runtime_numbers = count()
 
 class SequentialRollouts:
     """Keep one model worker group resident and switch only when needed."""
-    def __init__(self, config):
+    def __init__(self, config, *, static_rollout=False):
         self.config = config
+        self.static_rollout = bool(static_rollout)
         self.current = None
 
         self.switch_seconds = 0.0
@@ -20,7 +21,8 @@ class SequentialRollouts:
         if self.current is None or (self.current.role, self.current.model_path) != (role, path):
             start = monotonic()
             self.close()
-            self.current = RolloutRuntime(self.config, role, model_path=path, sampling=sampling)
+            self.current = RolloutRuntime(self.config, role, model_path=path, sampling=sampling,
+                                          static_rollout=self.static_rollout)
             self.switch_seconds += monotonic() - start
         self.current.action_sampling = dict(sampling or self.config[role].action)
         self.current.sampling = self.current.action_sampling
@@ -33,7 +35,7 @@ class SequentialRollouts:
 
 
 class RolloutRuntime:
-    def __init__(self, config, role, model_path=None, sampling=None):
+    def __init__(self, config, role, model_path=None, sampling=None, *, static_rollout=False):
         import ray
         from omegaconf import OmegaConf
         from verl.utils import hf_tokenizer
@@ -58,8 +60,9 @@ class RolloutRuntime:
             capacity = max([capacity] + [settings[name].max_tokens for name in ("review", "reflection") if name in settings])
         base = Path(__file__).resolve().parents[2] / "verl/trainer/config/generation.yaml"
         worker_config = OmegaConf.load(base)
-        worker_config.model.path = model_path or settings.model_path
+        worker_config.model.path = self.model_path
         worker_config.rollout.update(
+            static_rollout=bool(static_rollout),
             seed=int(config.run.generation_seed),
             n=1, prompt_length=settings.prompt_length, response_length=capacity,
             tensor_model_parallel_size=settings.tensor_parallel_size,
@@ -79,6 +82,7 @@ class RolloutRuntime:
         self.pool = RayResourcePool([settings.n_gpus], name_prefix=self.name_prefix, max_colocate_count=1)
         worker = RayClassWithInitArgs(ray.remote(ActorRolloutRefWorker), config=worker_config, role="rollout")
         self.group = RayWorkerGroup(self.pool, worker, name_prefix=self.name_prefix)
+        print(f"Initializing {role} rollout: checkpoint={self.model_path}, static_rollout={static_rollout}", flush=True)
         self.group.init_model()
         self.request_index = 0
         self.sampling = self.action_sampling

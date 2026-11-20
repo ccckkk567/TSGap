@@ -309,7 +309,7 @@ class ActorRolloutRefWorker(Worker):
 
         elif rollout_name == 'vllm':
             from verl.workers.rollout.vllm_rollout import vLLMRollout, vllm_mode
-            from verl.workers.sharding_manager import FSDPVLLMShardingManager
+            from verl.workers.sharding_manager import BaseShardingManager, FSDPVLLMShardingManager
             log_gpu_memory_usage(f'Before building {rollout_name} rollout', logger=None)
             local_path = copy_to_local(self.config.model.path)
             if vllm_mode == 'customized':
@@ -327,13 +327,17 @@ class ActorRolloutRefWorker(Worker):
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")
             log_gpu_memory_usage(f'After building {rollout_name} rollout', logger=None)
-            if torch.distributed.get_world_size() == 1:
-                self.config.rollout.load_format = 'dummy_hf'
-            rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
-                                                               inference_engine=rollout.inference_engine,
-                                                               model_config=self.actor_model_config,
-                                                               full_params='hf' in self.config.rollout.load_format,
-                                                               device_mesh=rollout_device_mesh)
+            if self.static_rollout:
+                rollout_sharding_manager = BaseShardingManager()
+            else:
+                if torch.distributed.get_world_size() == 1:
+                    self.config.rollout.load_format = 'dummy_hf'
+                rollout_sharding_manager = FSDPVLLMShardingManager(
+                    module=self.actor_module_fsdp,
+                    inference_engine=rollout.inference_engine,
+                    model_config=self.actor_model_config,
+                    full_params='hf' in self.config.rollout.load_format,
+                    device_mesh=rollout_device_mesh)
             log_gpu_memory_usage('After building sharding manager', logger=None)
 
         elif rollout_name == 'sglang':
@@ -365,6 +369,15 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
+        self.static_rollout = bool(self.config.get("rollout", {}).get("static_rollout", False))
+        if self.static_rollout:
+            vllm_mode = None
+            if self.config.rollout.name == "vllm":
+                from verl.workers.rollout.vllm_rollout import vllm_mode
+            if (self.role != "rollout" or vllm_mode != "spmd" or self.world_size != 1
+                    or self.config.rollout.tensor_model_parallel_size != 1):
+                raise ValueError("static_rollout requires role='rollout', vLLM SPMD, world size 1 and TP 1")
+
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
 
