@@ -173,7 +173,7 @@ def recover_training_result(directory, work, final, group, number, source):
         return None
     saved = Path(summary["checkpoint"])
     if not final.is_dir():
-        if saved.parent != work or not saved.name.startswith("global_step_") or not saved.is_dir():
+        if saved.parent.resolve() != work.resolve() or not saved.name.startswith("global_step_") or not saved.is_dir():
             raise RuntimeError(f"Completed trainer output is missing: {saved}")
         final.parent.mkdir(parents=True, exist_ok=True)
         saved.rename(final)
