@@ -428,7 +428,7 @@ Run 03 uses the published Run 02 BC Student and its fixed task manifests. Its ow
 
 ### Prepare the checkout and rollout environment
 
-After merging the Run 03 PR, create the new checkout once on the login node. Confirm the repository with `worktree list` first. Keep the new checkout at this revision while its jobs are queued or running.
+Create the Run 03 worktree once on the Orion login node from the published `run03` branch. Validate Run 03 from this worktree. After validation and approval, merge the branch into `main` on GitHub. Keep the Orion worktree at its pinned revision while its jobs are queued or running.
 
 ```bash
 (
@@ -437,8 +437,8 @@ After merging the Run 03 PR, create the new checkout once on the login node. Con
   BASE="$ROOT/code/TSGap"
   DEV="$ROOT/code/TSGap-run03"
   git -C "$BASE" worktree list
-  git -C "$BASE" fetch origin main
-  git -C "$BASE" worktree add --detach "$DEV" origin/main
+  git -C "$BASE" fetch origin run03
+  git -C "$BASE" worktree add --detach "$DEV" origin/run03
   git -C "$DEV" log -1 --oneline
 )
 ```
