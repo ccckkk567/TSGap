@@ -62,8 +62,8 @@ def check_orion_run(path, mode):
     else:
         raise ValueError(f"Unknown preflight mode: {mode}")
     if mode == "main":
-        from agent_system.teaching.interactive import require_bc_ready
-        require_bc_ready(cfg)
+        from agent_system.teaching.interactive import require_bc_model_ready
+        require_bc_model_ready(cfg)
         return
 
     from safetensors import safe_open

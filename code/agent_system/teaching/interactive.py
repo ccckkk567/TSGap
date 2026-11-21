@@ -429,13 +429,24 @@ def bc_model(config, marker):
     return path
 
 
-def require_bc_ready(config):
-    """Validate the shared baseline without modifying artifacts or loading weights."""
+def require_bc_model_ready(config):
+    """Check the published BC model and fixed manifests before starting Main."""
     output = Path(config.run.output_dir)
     try:
         bc = read_marker(output, "bc", 0)
-        model = bc_model(config, bc)
+        bc_model(config, bc)
         manifests = prepare_interactive_manifests(config, allow_create=False)
+        return bc, manifests
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError(f"BC checkpoint is not ready; publish BC first: {error}") from error
+
+
+def require_bc_ready(config):
+    """Validate completed BC evaluation and the round-zero report."""
+    bc, manifests = require_bc_model_ready(config)
+    model = bc["output_checkpoint"]
+    output = Path(config.run.output_dir)
+    try:
         subset = {}
         for scope in ("full", "subset"):
             for split in EVAL_SPLITS:
@@ -473,7 +484,7 @@ def run_interactive(config, stage, train_fn, *, group=None):
             raise ValueError("Main requires a chosen, teacher or guided group")
         if list(config.interactive.groups) != ["chosen", "teacher", "guided"]:
             raise ValueError("Interactive groups must be chosen, teacher, guided in protocol order")
-        bc, manifests = require_bc_ready(config)
+        bc, manifests = require_bc_model_ready(config)
     if system_path.read_text(encoding="utf-8") != SYSTEM:
         raise ValueError(f"Teacher review prompt differs from the saved BC input: {system_path}")
     excluded = {r["game_file"] for name in ("bc", "train") for r in manifests[name]}
@@ -530,6 +541,7 @@ def run_interactive(config, stage, train_fn, *, group=None):
 
 
 def summarize_interactive(config):
+    require_bc_ready(config)
     output = Path(config.run.output_dir)
     scope = "full" if config.evaluation.full_at_final else "subset"
     comparison = {}

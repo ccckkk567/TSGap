@@ -135,11 +135,18 @@ stopped, resume the same run with its saved config:
 bash /scratch/prjsnnn0000269/Students/shuming/cjk/scripts/submit_interactive.sh bc-only --bc-resume
 ```
 
-After BC succeeds and its allocation ends, queue the six Main jobs:
+When BC has published its checkpoint and `sft/bc/train_complete.json`, queue
+the six Main jobs. Any running BC evaluation can continue alongside them.
+Each Main branch's second allocation waits for its own first allocation to end.
 
 ```bash
 bash /scratch/prjsnnn0000269/Students/shuming/cjk/scripts/submit_interactive.sh mains-only --main-segments 2
 ```
+
+If deploying an update during BC, keep its checkout at its submitted commit.
+Run the updated submitter from a separate Git worktree and set
+`TSGAP_MAIN_REPO` to that worktree's absolute path for `mains-only`. The
+submitter and the Main jobs use that checkout and the same run artifacts.
 
 Both workflows print job IDs and append each accepted segment immediately to
 `$ROOT/logs/interactive_run02_teacher32b-submissions.tsv`. On partial submission
@@ -177,10 +184,11 @@ four reports under `eval/bc/round_000/{full,subset}/{valid_seen,valid_unseen}`
 and the subset curve under `rounds/round_000.json`, using the BC tracking
 namespace. With matching tasks, checkpoint, settings and seeds, subset reuses
 full episodes. A BC resume skips published training and completes missing
-evaluation work. Each Main independently verifies the baseline and resumes
+evaluation work. Each Main verifies the published BC checkpoint and resumes
 from its own saved rounds. Inspect branch-specific round 5/10 artifacts.
 
-**Final CPU comparison.** After all three branches finish, submit the existing
+**Final CPU comparison.** After the BC evaluation, round-zero report, and all
+three branches finish, submit the existing
 summary separately. The batch submitter leaves this operation to the user.
 
 ```bash

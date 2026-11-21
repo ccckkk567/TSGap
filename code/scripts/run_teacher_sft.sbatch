@@ -16,7 +16,7 @@ if (( $# )); then
     exit 2
 fi
 ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
-REPO="$ROOT/code/TSGap"
+REPO="${TSGAP_MAIN_REPO:-$ROOT/code/TSGap}"
 CODE="$REPO/code"
 VENV="$ROOT/envs/alfworld"
 CONFIG="${TSGAP_INTERACTIVE_CONFIG:-$CODE/examples/teaching/interactive_config.yaml}"

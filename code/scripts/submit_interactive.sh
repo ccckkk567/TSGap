@@ -28,9 +28,14 @@ for limit in "$bc_time" "$main_time"; do
         { echo "testqueue requires a positive HH:MM:SS up to 18:00:00" >&2; exit 2; }
 done
 [[ $mode != mains-only || $bc_resume == 0 ]] || usage
+if [[ $mode != mains-only && -n ${TSGAP_MAIN_REPO:-} ]]; then
+    echo "TSGAP_MAIN_REPO is only supported with mains-only" >&2
+    exit 2
+fi
 
 ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
-REPO="$ROOT/code/TSGap"
+REPO="${TSGAP_MAIN_REPO:-$ROOT/code/TSGap}"
+[[ $REPO == /* ]] || { echo "TSGAP_MAIN_REPO must be an absolute path" >&2; exit 2; }
 CODE="$REPO/code"
 RUN=interactive_run02_teacher32b
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -48,8 +53,10 @@ exec 9>>"$record"
 flock -n 9 || { echo "Another submission is using $record" >&2; exit 1; }
 diagnose='Inspect squeue -u "$USER" -o "%.18i %.32j %.10T %.48E %R" and the submission record.'
 queued=$(squeue -h -u "$USER" -o '%i %j') || { echo "$diagnose" >&2; exit 1; }
-if ! awk 'FILENAME == ARGV[1] {ids[$3]=1; next}
-    NF && (NF != 2 || $1 in ids || $2 ~ /^tsgap-32b-/ || $2 == "tsgap-experiment") {print; conflict=1}
+if ! awk -v mode="$mode" 'FILENAME == ARGV[1] {stages[$3]=$1; next}
+    NF == 2 && mode == "mains-only" &&
+        ($1 in stages ? stages[$1] == "bc" : $2 ~ /^tsgap-32b-bc(-[0-9]+)?$/) {next}
+    NF && (NF != 2 || $1 in stages || $2 ~ /^tsgap-32b-/ || $2 == "tsgap-experiment") {print; conflict=1}
     END {exit conflict}' "$record" - <<< "$queued"; then
     echo "Possible active writer for $RUN. $diagnose See $record" >&2
     exit 1
