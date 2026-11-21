@@ -422,6 +422,93 @@ To add a new environment:
 2. Write the corresponding prompt files in the `agent_system/environments/prompts/` directory.
 3. Add an environment manager in `agent_system/environments/env_manager.py` to provide multi-threading support.
 
+## Run 03 on Orion
+
+Run 03 uses the published Run 02 BC Student and its fixed task manifests. Its own baseline evaluation and three ten-round branches can run concurrently. The rollout process uses one GPU with one offline engine at a time. Qwen3-4B SFT runs in the existing alfworld environment.
+
+### Prepare the checkout and rollout environment
+
+After merging the Run 03 PR, create the new checkout once on the login node. Confirm the repository with `worktree list` first. Keep the new checkout at this revision while its jobs are queued or running.
+
+```bash
+(
+  set -eu
+  ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+  BASE="$ROOT/code/TSGap"
+  DEV="$ROOT/code/TSGap-run03"
+  git -C "$BASE" worktree list
+  git -C "$BASE" fetch origin main
+  git -C "$BASE" worktree add --detach "$DEV" origin/main
+  git -C "$DEV" log -1 --oneline
+)
+```
+
+Check the driver and supported CUDA version in an existing H200 job's `nvidia-smi` output. For a driver supporting CUDA 12.9, use the following candidate on the network-enabled IO partition. The wheel resolver selects the corresponding Torch build. The preparation log reports the installed versions.
+
+```bash
+ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+mkdir -p "$ROOT/logs"
+sbatch --parsable --account=prjsnnn0000269 --partition=ioqueue --cpus-per-task=4 \
+  --mem=32G --time=06:00:00 --job-name=tsgap-r03-prep --output="$ROOT/logs/%x-%j.out" <<'PREP'
+#!/bin/bash -l
+set -eo pipefail
+ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+DEV="$ROOT/code/TSGap-run03"
+VENV="$ROOT/envs/rollout"
+export HF_HOME="$ROOT/downloads/huggingface" UV_CACHE_DIR="$ROOT/downloads/uv"
+unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
+module load python/3.11.9
+python -m venv "$VENV"
+"$VENV/bin/python" -m pip install -U uv
+"$VENV/bin/uv" pip install --python "$VENV/bin/python" --torch-backend=cu129 \
+  --extra-index-url https://wheels.vllm.ai/0.32.0/cu129 --only-binary=vllm \
+  -r "$DEV/code/requirements-rollout.txt"
+"$VENV/bin/python" -c 'from importlib.metadata import version; import torch; print("vLLM", version("vllm"), "transformers", version("transformers"), "torch", torch.__version__, "CUDA", torch.version.cuda)'
+"$VENV/bin/python" - "$ROOT/models/Qwen3.8-27B" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+snapshot_download("Qwen/Qwen3.8-27B", local_dir=sys.argv[1])
+PY
+PREP
+```
+
+### Initialize the shared BC and submit the eight GPU segments
+
+After preparation succeeds, run the block below once on the login node. Initialization requires Run 02's published `sft/bc/train_complete.json`. It links the source checkpoint into the Run 03 checkpoint root, copies the manifests and small summaries, and publishes a local marker last. Source training counts are inherited. Evaluation scores come from Run 03.
+
+```bash
+(
+  set -eo pipefail
+  ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+  export TSGAP_REPO="$ROOT/code/TSGap-run03"
+  CODE="$TSGAP_REPO/code"
+  export TSGAP_INTERACTIVE_CONFIG="$CODE/examples/teaching/run03.yaml"
+  export ALFWORLD_DATA="$ROOT/data/alfworld" HF_HOME="$ROOT/downloads/huggingface"
+  module load python/3.11.9
+  cd "$CODE"
+  "$ROOT/envs/rollout/bin/python" -m scripts.teaching_experiment init-bc --config "$TSGAP_INTERACTIVE_CONFIG"
+  bash "$CODE/scripts/submit_interactive.sh" bc-only --bc-resume --bc-segments 2 --bc-time 06:00:00
+  bash "$CODE/scripts/submit_interactive.sh" mains-only --main-segments 2 --main-time 06:00:00
+  cat "$ROOT/logs/interactive_run03-submissions.tsv"
+)
+```
+
+Each branch's first segment is independently eligible. Its second has an `afterany` dependency on its own first segment. The two BC evaluation segments form a separate chain. If submission stops halfway, consult the journal and queue for accepted jobs before submitting missing segments. The first real trajectories record raw completions, environment responses, finish reasons, and request costs. The SFT log records the interpreter and checkout.
+
+After round zero and the three branches finish, generate the comparison in the Run 03 output directory. The online summary uses the same private SwanLab credentials as the experiment jobs.
+
+```bash
+(
+  set -eo pipefail
+  ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
+  module load python/3.11.9
+  cd "$ROOT/code/TSGap-run03/code"
+  source "$ROOT/dep-prep-credentials.env"
+  "$ROOT/envs/rollout/bin/python" -m scripts.teaching_experiment interactive-summary \
+    --config "$PWD/examples/teaching/run03.yaml"
+)
+```
+
 ## Acknowledgement
 
 We sincerely appreciate the infrastructure provided by [veRL](https://github.com/volcengine/verl "veRL") and [verl-agent](github.com/langfengQ/verl-agent "verl-agent"). We also thank [ALFWorld](https://github.com/alfworld/alfworld "ALFWorld"), [ScienceWorld](https://github.com/allenai/ScienceWorld "ScienceWorld"), and other projects for offering interactive agent environments.

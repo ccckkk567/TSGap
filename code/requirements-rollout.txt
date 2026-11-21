@@ -1,0 +1,23 @@
+# Offline inference and ALFWorld. The vLLM wheel selects its matching torch build.
+vllm==0.32.0
+transformers>=5.16.1,<5.20.0
+alfworld==0.4.2
+textworld[pddl]==1.6.2
+gymnasium==0.29.1
+ray[default]
+omegaconf
+hydra-core
+numpy
+pandas
+pyarrow
+safetensors
+huggingface-hub
+swanlab
+requests
+pyyaml
+opencv-python-headless
+Pillow
+einops
+tensordict
+termcolor
+filelock

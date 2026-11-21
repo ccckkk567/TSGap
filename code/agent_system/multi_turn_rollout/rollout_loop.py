@@ -75,7 +75,7 @@ class TrajectoryCollector:
 
         # Apply chat template
         prompt_with_chat_template = self.tokenizer.apply_chat_template(
-            obs["messages"][item] if "messages" in obs else chat,
+            obs["messages"][item] if "messages" in obs else chat.tolist(),
             add_generation_prompt=True,
             tokenize=False,
             **self.chat_template_kwargs,
@@ -354,9 +354,11 @@ class TrajectoryCollector:
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
 
+            text_actions = batch_output.meta_info.pop("visible_responses", None)
             batch = batch.union(batch_output)
 
-            text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+            if text_actions is None:
+                text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
 
             if episode_recorder is not None:
                 episode_recorder.before_step(envs, obs, text_actions, active_masks)

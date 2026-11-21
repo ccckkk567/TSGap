@@ -43,6 +43,8 @@ def collect_metrics(episodes, tasks, group, budget, horizon, errors):
             result[f"teacher/{key}_count"] = decisions[key]
         result["teacher/applied_count"] = len(applied)
         if len(reviews) > decisions["error"]:
+            if any("finish_reason" in r for r in reviews):
+                result["teacher/no_feedback_rate"] = decisions["no_feedback"] / (len(reviews) - decisions["error"])
             result["teacher/intervention_rate"] = len(applied) / (len(reviews) - decisions["error"])
         for guided in (True, False):
             subset = [e for e in episodes if any(s["generated_with_feedback"] for s in e["steps"]) == guided]
@@ -61,6 +63,9 @@ def collect_metrics(episodes, tasks, group, budget, horizon, errors):
         requests.extend(e["interrupted_step"] for e in errors if e["source_actor"] == role and "interrupted_step" in e)
         if role == "teacher":
             requests.extend(reviews)
+        finished = [r for r in requests if r.get("finish_reason") is not None]
+        if finished:
+            result[f"cost/{role}_truncated_requests"] = sum(r["finish_reason"] == "length" for r in finished)
         for key in ("input_tokens", "output_tokens"):
             result[f"cost/{role}_{key}"] = sum(r.get(key, 0) for r in requests)
     result["cost/review_seconds"] = sum(r.get("generation_seconds", 0) for r in reviews)

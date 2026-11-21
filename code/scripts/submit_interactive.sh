@@ -28,16 +28,15 @@ for limit in "$bc_time" "$main_time"; do
         { echo "testqueue requires a positive HH:MM:SS up to 18:00:00" >&2; exit 2; }
 done
 [[ $mode != mains-only || $bc_resume == 0 ]] || usage
-if [[ $mode != mains-only && -n ${TSGAP_MAIN_REPO:-} ]]; then
+if [[ $mode != mains-only && -z ${TSGAP_REPO:-} && -n ${TSGAP_MAIN_REPO:-} ]]; then
     echo "TSGAP_MAIN_REPO is only supported with mains-only" >&2
     exit 2
 fi
 
 ROOT=/scratch/prjsnnn0000269/Students/shuming/cjk
-REPO="${TSGAP_MAIN_REPO:-$ROOT/code/TSGap}"
-[[ $REPO == /* ]] || { echo "TSGAP_MAIN_REPO must be an absolute path" >&2; exit 2; }
+REPO="${TSGAP_REPO:-${TSGAP_MAIN_REPO:-$ROOT/code/TSGap}}"
+[[ $REPO == /* ]] || { echo "Repository must be an absolute path" >&2; exit 2; }
 CODE="$REPO/code"
-RUN=interactive_run02_teacher32b
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 case "$(hostname -s)" in orion-login01|orion-login02) ;; *) echo "Use an Orion login node" >&2; exit 1 ;; esac
 for cmd in git sbatch squeue flock; do
@@ -47,16 +46,33 @@ for name in run_bc.sbatch run_chosen_sft.sbatch run_teacher_sft.sbatch run_guide
     cmp -s "$SCRIPT_DIR/$name" "$CODE/scripts/$name" ||
         { echo "Missing or stale $name. Copy the five entries together from $CODE/scripts." >&2; exit 1; }
 done
+export TSGAP_INTERACTIVE_CONFIG="${TSGAP_INTERACTIVE_CONFIG:-$CODE/examples/teaching/interactive_config.yaml}"
+[[ $TSGAP_INTERACTIVE_CONFIG == /* && -f $TSGAP_INTERACTIVE_CONFIG ]] || { echo "Expected an absolute config path" >&2; exit 1; }
+module load python/3.11.9
+cd "$CODE"
+bootstrap="$ROOT/envs/rollout/bin/python"
+[[ -x $bootstrap ]] || bootstrap="$ROOT/envs/alfworld/bin/python"
+settings=$("$bootstrap" -c 'import sys; from scripts.teaching_experiment import orion_settings; print(*orion_settings(sys.argv[1]))' "$TSGAP_INTERACTIVE_CONFIG")
+read -r RUN prefix backend <<< "$settings"
+[[ $RUN =~ ^[a-zA-Z0-9_-]+$ && $prefix =~ ^[a-zA-Z0-9_-]+$ ]] || usage
+VENV="$ROOT/envs/alfworld"
+if [[ $backend == direct ]]; then
+    VENV="$ROOT/envs/rollout"
+    if [[ $mode == all || ( $mode == bc-only && $bc_resume == 0 ) ]]; then
+        echo "Run init-bc, then use bc-only --bc-resume and mains-only separately." >&2
+        exit 2
+    fi
+fi
 mkdir -p "$ROOT/logs"
 record="$ROOT/logs/$RUN-submissions.tsv"
 exec 9>>"$record"
 flock -n 9 || { echo "Another submission is using $record" >&2; exit 1; }
 diagnose='Inspect squeue -u "$USER" -o "%.18i %.32j %.10T %.48E %R" and the submission record.'
 queued=$(squeue -h -u "$USER" -o '%i %j') || { echo "$diagnose" >&2; exit 1; }
-if ! awk -v mode="$mode" 'FILENAME == ARGV[1] {stages[$3]=$1; next}
+if ! awk -v mode="$mode" -v prefix="$prefix" 'FILENAME == ARGV[1] {stages[$3]=$1; next}
     NF == 2 && mode == "mains-only" &&
-        ($1 in stages ? stages[$1] == "bc" : $2 ~ /^tsgap-32b-bc(-[0-9]+)?$/) {next}
-    NF && (NF != 2 || $1 in stages || $2 ~ /^tsgap-32b-/ || $2 == "tsgap-experiment") {print; conflict=1}
+        ($1 in stages ? stages[$1] == "bc" : $2 ~ ("^" prefix "-bc(-[0-9]+)?$")) {next}
+    NF && (NF != 2 || $1 in stages || index($2, prefix "-") == 1 || (prefix == "tsgap-32b" && $2 == "tsgap-experiment")) {print; conflict=1}
     END {exit conflict}' "$record" - <<< "$queued"; then
     echo "Possible active writer for $RUN. $diagnose See $record" >&2
     exit 1
@@ -64,16 +80,12 @@ fi
 
 TSGAP_EXPECTED_COMMIT=$(git -C "$REPO" rev-parse HEAD)
 export TSGAP_EXPECTED_COMMIT
-export TSGAP_INTERACTIVE_CONFIG="${TSGAP_INTERACTIVE_CONFIG:-$CODE/examples/teaching/interactive_config.yaml}"
-[[ $TSGAP_INTERACTIVE_CONFIG == /* && -f $TSGAP_INTERACTIVE_CONFIG ]] || { echo "Expected an absolute config path" >&2; exit 1; }
 printf 'commit=%s config=%s run=%s mode=%s bc_segments=%s main_segments=%s\n' \
     "$TSGAP_EXPECTED_COMMIT" "$TSGAP_INTERACTIVE_CONFIG" "$RUN" "$mode" "$bc_segments" "$main_segments"
 git -C "$REPO" status --short --branch
 preflight=fresh
 if [[ $mode == mains-only ]]; then preflight=main; elif (( bc_resume )); then preflight=resume; fi
-module load python/3.11.9
-cd "$CODE"
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "$ROOT/envs/alfworld/bin/python" -c \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "$VENV/bin/python" -c \
     'import sys; from scripts.teaching_experiment import check_orion_run; check_orion_run(*sys.argv[1:])' \
     "$TSGAP_INTERACTIVE_CONFIG" "$preflight"
 
@@ -89,7 +101,7 @@ printf 'stage\tsegment\tjob_id\tdependency\tscript\tcommit\n'
 submit() {
     local stage=$1 segment=$2 dependency=$3 limit=$4 script=$5
     shift 5
-    local args=(--parsable --export=ALL --time="$limit" --job-name="tsgap-32b-$stage-$segment")
+    local args=(--parsable --export=ALL --time="$limit" --job-name="$prefix-$stage-$segment")
     if [[ -n $dependency ]]; then args+=(--dependency="$dependency"); fi
     local reply
     reply=$(sbatch "${args[@]}" "$script" "$@")

@@ -39,9 +39,6 @@ class RolloutRuntime:
         import ray
         from omegaconf import OmegaConf
         from verl.utils import hf_tokenizer
-        from verl.utils.fs import copy_to_local
-        from verl.workers.fsdp_workers import ActorRolloutRefWorker
-        from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
         from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
         settings = config[role]
         if settings.n_gpus > config.hardware.n_gpus:
@@ -58,12 +55,46 @@ class RolloutRuntime:
         capacity = self.action_sampling["max_tokens"]
         if role == "teacher":
             capacity = max([capacity] + [settings[name].max_tokens for name in ("review", "reflection") if name in settings])
+        backend = config.get("interactive", {}).get("inference_backend", "legacy")
+        if backend not in ("legacy", "direct"):
+            raise ValueError(f"Unknown inference backend: {backend}")
+        self.direct = backend == "direct"
+        tokenizer_path = self.model_path
+        if not self.direct:
+            from verl.utils.fs import copy_to_local
+            tokenizer_path = copy_to_local(tokenizer_path)
+        self.tokenizer = hf_tokenizer(tokenizer_path)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.collector = TrajectoryCollector(OmegaConf.create({
+            "data": {"max_prompt_length": settings.prompt_length, "return_raw_chat": True},
+            "env": {"max_steps": config.env.max_steps, "rollout": {"n": 1}},
+        }), self.tokenizer, chat_template_kwargs=self.action_chat_template_kwargs)
+        if self.direct:
+            from .inference import InferenceWorker
+            if settings.n_gpus != 1 or settings.tensor_parallel_size != 1:
+                raise ValueError("Direct inference requires one GPU and TP=1")
+            self.worker = ray.remote(num_gpus=1)(InferenceWorker).remote(
+                self.model_path, settings.prompt_length + capacity, settings.gpu_memory_utilization)
+            # Include engine initialization in the model switching time.
+            ray.get(self.worker.__ray_ready__.remote())
+        else:
+            self._init_legacy(settings, capacity, static_rollout)
+        self.request_index = 0
+        self.sampling = self.action_sampling
+        self.episode_seed = 0
+
+    def _init_legacy(self, settings, capacity, static_rollout):
+        import ray
+        from omegaconf import OmegaConf
+        from verl.workers.fsdp_workers import ActorRolloutRefWorker
+        from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
         base = Path(__file__).resolve().parents[2] / "verl/trainer/config/generation.yaml"
         worker_config = OmegaConf.load(base)
         worker_config.model.path = self.model_path
         worker_config.rollout.update(
             static_rollout=bool(static_rollout),
-            seed=int(config.run.generation_seed),
+            seed=int(self.config.run.generation_seed),
             n=1, prompt_length=settings.prompt_length, response_length=capacity,
             tensor_model_parallel_size=settings.tensor_parallel_size,
             gpu_memory_utilization=settings.gpu_memory_utilization,
@@ -71,22 +102,12 @@ class RolloutRuntime:
             max_num_batched_tokens=settings.prompt_length + capacity,
             enable_chunked_prefill=False,
         )
-        self.tokenizer = hf_tokenizer(copy_to_local(worker_config.model.path))
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.collector = TrajectoryCollector(OmegaConf.create({
-            "data": {"max_prompt_length": settings.prompt_length, "return_raw_chat": True},
-            "env": {"max_steps": config.env.max_steps, "rollout": {"n": 1}},
-        }), self.tokenizer, chat_template_kwargs=self.action_chat_template_kwargs)
-        self.name_prefix = f"teaching_{role}_{next(_runtime_numbers)}"
+        self.name_prefix = f"teaching_{self.role}_{next(_runtime_numbers)}"
         self.pool = RayResourcePool([settings.n_gpus], name_prefix=self.name_prefix, max_colocate_count=1)
         worker = RayClassWithInitArgs(ray.remote(ActorRolloutRefWorker), config=worker_config, role="rollout")
         self.group = RayWorkerGroup(self.pool, worker, name_prefix=self.name_prefix)
-        print(f"Initializing {role} rollout: checkpoint={self.model_path}, static_rollout={static_rollout}", flush=True)
+        print(f"Initializing {self.role} rollout: checkpoint={self.model_path}, static_rollout={static_rollout}", flush=True)
         self.group.init_model()
-        self.request_index = 0
-        self.sampling = self.action_sampling
-        self.episode_seed = 0
 
     def generate_sequences(self, data):
         from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -95,6 +116,8 @@ class RolloutRuntime:
         )
         self.request_index += 1
         started = monotonic()
+        if self.direct:
+            return self._generate_direct(data, data.meta_info["sampling_overrides"], started)
         padded, padding = pad_dataproto_to_divisor(data, self.group.world_size)
         output = unpad_dataproto(self.group.generate_sequences(padded), padding)
         width = output.batch["responses"].shape[-1]
@@ -104,6 +127,39 @@ class RolloutRuntime:
                                     output_tokens=min(int(mask[-width:].sum()), self.sampling["max_tokens"]),
                                     generation_seconds=monotonic() - started)
         return output
+
+    def _generate_direct(self, data, sampling, started):
+        import ray
+        import torch
+        from verl import DataProto
+
+        prompts = [list(map(int, ids)) for ids in data.non_tensor_batch["raw_prompt_ids"]]
+        results = ray.get(self.worker.generate.remote(prompts, sampling))
+        width = max(1, max(len(ids) for ids, _, _ in results))
+        responses = torch.full((len(results), width), self.tokenizer.pad_token_id, dtype=torch.long)
+        response_mask = torch.zeros_like(responses)
+        visible = []
+        for i, (ids, finish, stop) in enumerate(results):
+            responses[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+            response_mask[i, :len(ids)] = 1
+            # Preserve reasoning delimiters even if the tokenizer marks them special.
+            terminal = (self.tokenizer.eos_token_id, self.tokenizer.pad_token_id)
+            content = ids[:-1] if ids and ids[-1] in terminal else ids
+            raw = self.tokenizer.decode(content, skip_special_tokens=False)
+            tail = self.tokenizer.decode(prompts[i][-16:], skip_special_tokens=False)
+            prefix = tail[tail.rfind("<think>"):] if tail.rstrip().endswith("<think>") else ""
+            visible.append(prefix + raw if not raw.lstrip().startswith("<think>") else raw)
+            if i == 0:  # EpisodeSession and review each issue one request at a time.
+                self.last_generation = dict(
+                    generation_seed=sampling["seed"], input_tokens=len(prompts[i]),
+                    output_tokens=len(ids), generation_seconds=monotonic() - started,
+                    finish_reason=finish, stop_reason=stop, raw_completion=raw)
+        mask = torch.cat((data.batch["attention_mask"], response_mask), dim=1)
+        return DataProto.from_dict(tensors={
+            "responses": responses, "prompts": data.batch["input_ids"],
+            "input_ids": torch.cat((data.batch["input_ids"], responses), dim=1),
+            "attention_mask": mask,
+        }, meta_info={"visible_responses": visible})
 
     def initial_batch(self):
         import numpy as np
@@ -147,6 +203,8 @@ class RolloutRuntime:
         try:
             batch = self.collector.preprocess_batch(self.initial_batch(), {"messages": [messages]})
             output = self.generate_sequences(batch)
+            if self.direct:
+                return self.last_generation["raw_completion"], self.last_generation
             return self.tokenizer.decode(output.batch["responses"][0], skip_special_tokens=True), self.last_generation
         finally:
             self.sampling = self.action_sampling
@@ -168,6 +226,17 @@ class RolloutRuntime:
     def close(self):
         import ray
         import time
+        if self.direct:
+            try:
+                ray.get(self.worker.close.remote())
+            finally:
+                ray.kill(self.worker, no_restart=True)
+            deadline = monotonic() + 30
+            while ray.available_resources().get("GPU", 0) < 1:
+                if monotonic() >= deadline:
+                    raise RuntimeError("Previous inference actor has not released its GPU")
+                time.sleep(0.1)
+            return
         from ray.util import remove_placement_group, placement_group_table
         from ray.util.state import get_actor
         workers = list(self.group._workers)
@@ -293,6 +362,9 @@ class EpisodeSession:
             raise
         event.update(cost, raw_response=raw)
         value = raw.strip()
+        if runtime.direct and value.startswith("<think>"):
+            _, end, body = value.partition("</think>")
+            value = body.strip() if end else ""
         if value == "NO_FEEDBACK":
             event["decision"] = "no_feedback"
         elif value:

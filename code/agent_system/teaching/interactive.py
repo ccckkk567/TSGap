@@ -20,7 +20,9 @@ def round_path(group, number):
 def rollout_models(config):
     import os
     import ray
-    options = dict(address=config.hardware.ray_address, runtime_env={"env_vars": {"VLLM_USE_V1": "0"}})
+    options = dict(address=config.hardware.ray_address)
+    if config.interactive.get("inference_backend", "legacy") == "legacy":
+        options["runtime_env"] = {"env_vars": {"VLLM_USE_V1": "0"}}
     if options["address"] is None:
         options["num_gpus"] = config.hardware.n_gpus
         job_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
@@ -429,6 +431,61 @@ def bc_model(config, marker):
     return path
 
 
+def initialize_shared_bc(config):
+    """Publish this run's reference to a previously published BC model."""
+    from omegaconf import OmegaConf
+    from agent_system.environments.prompts.teacher_review import SYSTEM
+
+    output = Path(config.run.output_dir)
+    source = Path(config.bc.reuse_from)
+    source_settings = source / "config.yaml"
+    previous = read_marker(source, "bc", 0)
+    if previous is None:
+        raise FileNotFoundError(f"Wait for the source BC publication: {source}/sft/bc/train_complete.json")
+    source_cfg = OmegaConf.load(source_settings)
+    checkpoint = Path(bc_model(source_cfg, previous)).resolve(strict=True)
+    alias = Path(config.run.checkpoint_dir) / "bc"
+    if output.resolve() == source.resolve() or alias.parent.resolve() == checkpoint.parent:
+        raise ValueError("The reused BC requires a separate output and checkpoint root")
+    provenance = dict(reused_from_run=source_cfg.run.name, reused_from=str(source),
+                      source_checkpoint=str(checkpoint))
+    existing = read_marker(output, "bc", 0)
+    if existing:
+        if (existing.get("source_checkpoint") != str(checkpoint)
+                or not alias.is_symlink() or alias.resolve() != checkpoint):
+            raise ValueError(f"Existing BC publication differs from {checkpoint}")
+        require_bc_model_ready(config)
+        return alias
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    if alias.is_symlink():
+        if alias.resolve() != checkpoint:
+            raise ValueError(f"Unexpected BC symlink target: {alias}")
+    else:
+        alias.symlink_to(checkpoint, target_is_directory=True)
+    manifests = output / "manifests"
+    manifests.mkdir(exist_ok=True)
+    for path in (source / "manifests").glob("*.jsonl"):
+        shutil.copyfile(path, manifests / path.name)
+    prepare_interactive_manifests(config, allow_create=False)
+    directory = output / "sft/bc"
+    for relative in ("sft/bc/data_summary.json", "sft/bc/training_summary.json",
+                     "collect/bc/collection_summary.json"):
+        summary = read_json(source / relative)
+        summary.update(provenance)
+        if relative == "sft/bc/training_summary.json":
+            summary["checkpoint"] = str(alias)
+        write_json(output / relative, summary)
+    prompt = output / "prompts/teacher_review_system.txt"
+    prompt.parent.mkdir(exist_ok=True)
+    prompt.write_text(SYSTEM, encoding="utf-8")
+    write_json(directory / "train_complete.json", dict(
+        previous, **provenance, output_checkpoint=str(alias),
+        data_summary=str(directory / "data_summary.json"),
+        training_summary=str(directory / "training_summary.json")))
+    require_bc_model_ready(config)
+    return alias
+
+
 def require_bc_model_ready(config):
     """Check the published BC model and fixed manifests before starting Main."""
     output = Path(config.run.output_dir)
@@ -473,6 +530,8 @@ def run_interactive(config, stage, train_fn, *, group=None):
     is_bc = stage == "bc"
     if is_bc:
         bc = read_marker(output, "bc", 0)
+        if config.bc.get("reuse_from") and bc is None:
+            raise RuntimeError("Initialize the shared BC with init-bc before running evaluation")
         manifests = prepare_interactive_manifests(config, allow_create=bc is None)
         system_path.parent.mkdir(parents=True, exist_ok=True)
         if not system_path.exists():

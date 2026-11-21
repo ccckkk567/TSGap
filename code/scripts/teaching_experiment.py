@@ -34,6 +34,16 @@ def load_config(path, *, read_only=False):
     return config
 
 
+def orion_settings(path):
+    """Small config-only bootstrap before selecting the rollout interpreter."""
+    from omegaconf import OmegaConf
+    cfg = OmegaConf.load(path)
+    backend = cfg.interactive.get("inference_backend", "legacy")
+    if backend not in ("legacy", "direct"):
+        raise ValueError(f"Unknown inference backend: {backend}")
+    return cfg.run.name, cfg.interactive.get("job_prefix", "tsgap-32b"), backend
+
+
 def check_orion_run(path, mode):
     """Read-only preflight shared by the standalone Orion submission and job entries."""
     import json
@@ -41,15 +51,18 @@ def check_orion_run(path, mode):
 
     cfg = OmegaConf.load(path)
     root = Path("/scratch/prjsnnn0000269/Students/shuming/cjk")
-    name = "interactive_run02_teacher32b"
+    name = cfg.run.name
     output = root / "outputs/teaching" / name
     checkpoints = root.parent / "storage_ext/cjk/checkpoints" / name
-    teacher, student = (root / "models" / model for model in ("Qwen3-32B", "Qwen3-4B"))
-    if (cfg.run.name != name or Path(cfg.run.output_dir) != output
+    teacher, student = Path(cfg.teacher.model_path), Path(cfg.student.model_path)
+    if (Path(name).name != name or Path(cfg.run.output_dir) != output
             or Path(cfg.run.checkpoint_dir) != checkpoints or Path(cfg.logging.log_dir) != root / "logs" / name / "swanlab"
-            or Path(cfg.teacher.model_path) != teacher or Path(cfg.student.model_path) != student
+            or teacher.parent != root / "models" or student.parent != root / "models"
             or Path(cfg.sft.initial_model_path) != student or cfg.interactive.static_rollout is not True):
         raise ValueError("Unexpected Orion run, model, output paths or static rollout configuration")
+    reuse = cfg.bc.get("reuse_from")
+    if reuse and mode == "fresh":
+        raise ValueError("Use init-bc, then submit BC evaluation with --bc-resume")
     saved = output / "config.yaml"
     if mode == "fresh":
         if saved.exists():
@@ -61,9 +74,15 @@ def check_orion_run(path, mode):
         load_config(path, read_only=True)
     else:
         raise ValueError(f"Unknown preflight mode: {mode}")
-    if mode == "main":
+    if mode == "main" or reuse:
         from agent_system.teaching.interactive import require_bc_model_ready
         require_bc_model_ready(cfg)
+        if mode == "main":
+            return
+    if cfg.interactive.get("inference_backend") == "direct":
+        for model in (teacher, student):
+            if not (model / "config.json").is_file():
+                raise FileNotFoundError(f"Local rollout model is missing: {model}")
         return
 
     from safetensors import safe_open
@@ -152,15 +171,24 @@ def launch_sft(config, directory, input_checkpoint, checkpoint_work_dir, group, 
     OmegaConf.resolve(training)
     path = directory / "trainer.yaml"
     OmegaConf.save(training, path)
-    command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
+    code_dir = Path(__file__).resolve().parents[1]
+    python = str(config.sft.get("python") or sys.executable)
+    child_env = os.environ.copy()
+    child_env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(code_dir), child_env.get("PYTHONPATH"))))
+    if config.sft.get("python"):
+        venv = Path(python).parent.parent
+        child_env["VIRTUAL_ENV"] = str(venv)
+        child_env["PATH"] = str(venv / "bin") + os.pathsep + child_env["PATH"]
+    print(f"SFT Python={python} code={code_dir}", flush=True)
+    command = [python, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
                f"--nproc_per_node={config.sft.n_gpus}", "-m", "verl.trainer.fsdp_sft_trainer",
                "--config-path", str(directory.resolve()), "--config-name", "trainer"]
-    subprocess.run(command + [f"hydra.run.dir={directory.resolve()}"], check=True)
+    subprocess.run(command + [f"hydra.run.dir={directory.resolve()}"], check=True, cwd=code_dir, env=child_env)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["interactive", "interactive-summary", "sample", "collect", "baseline",
+    parser.add_argument("command", choices=["init-bc", "interactive", "interactive-summary", "sample", "collect", "baseline",
                                            "select", "export-sft", "train", "evaluate", "summarize"])
     parser.add_argument("--stage", choices=["bc", "main"])
     parser.add_argument("--resume", action="store_true")
@@ -181,6 +209,24 @@ def main():
     config_path = Path(args.run_dir) / "config.yaml" if args.run_dir else Path(args.config or (
         "examples/teaching/interactive_config.yaml" if args.command in ("interactive", "interactive-summary")
         else "examples/teaching/config.yaml"))
+    if args.command == "init-bc":
+        from filelock import FileLock
+        from omegaconf import OmegaConf
+        from agent_system.teaching.interactive import initialize_shared_bc
+        cfg = OmegaConf.load(config_path)
+        if not cfg.get("bc", {}).get("reuse_from"):
+            parser.error("init-bc requires a configuration with bc.reuse_from")
+        source = Path(cfg.bc.reuse_from)
+        output = Path(cfg.run.output_dir)
+        if output.resolve() == source.resolve():
+            parser.error("init-bc requires a separate run output directory")
+        if not (source / "sft/bc/train_complete.json").is_file():
+            parser.error(f"Wait for the published BC marker in {source}/sft/bc")
+        output.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(output / ".init-bc.lock")):
+            cfg = load_config(config_path, read_only=(output / "config.yaml").exists())
+            print(f"Shared BC ready: {initialize_shared_bc(cfg)}")
+        return
     branch_main = args.command == "interactive" and args.stage == "main"
     if branch_main and args.group not in ("chosen", "teacher", "guided"):
         parser.error("interactive --stage main requires --group chosen, teacher or guided")

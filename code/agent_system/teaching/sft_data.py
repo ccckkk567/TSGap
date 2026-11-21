@@ -70,6 +70,13 @@ def episode_rows(episode, tokenizer, chat_kwargs, metadata):
         chat = tokenizer.apply_chat_template([dict(role="user", content=question)],
                                               tokenize=False, add_generation_prompt=True,
                                               **chat_kwargs)
+        if "raw_completion" in step and chat.rstrip().endswith("<think>"):
+            # The Student prompt already supplies this part of the assistant turn.
+            prefix = chat[chat.rfind("<think>"):]
+            if answer.startswith(prefix):
+                answer = answer[len(prefix):]
+            elif answer.lstrip().startswith("<think>"):
+                answer = answer.lstrip().removeprefix("<think>")
         answer_length = len(tokenizer.encode(answer + tokenizer.eos_token, add_special_tokens=False))
         length = len(tokenizer.encode(chat, add_special_tokens=False)) + answer_length
         info = dict(metadata, question=question, answer=answer, task_id=episode["task_id"], step=step["step"])
